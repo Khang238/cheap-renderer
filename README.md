@@ -1,8 +1,8 @@
 So this is just a random renderer I used to render my things, nothing special or fancy
 
-Required: `taichi`, `numpy` and `opencv-python`
+Required: `taichi`, `pillow`, `numpy` and `opencv-python`
 ```bash
-pip install taichi numpy opencv-python
+pip install taichi numpy opencv-python pillow
 ```
 
 Usage:
