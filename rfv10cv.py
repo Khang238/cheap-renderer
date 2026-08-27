@@ -56,6 +56,7 @@ import base64
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -86,7 +87,7 @@ def _gpu_smoke_test():
 
 
 def init_taichi():
-    for backend in [ti.cpu]:   # GPU (opengl/vulkan) skipped -- older GPUs (e.g. Haswell iGPU)
+    for backend in [ti.cuda, ti.cpu]:   # GPU (opengl/vulkan) skipped -- older GPUs (e.g. Haswell iGPU)
         name = str(backend).split('.')[-1]      # don't support the features Taichi needs here.
         try:
             ti.init(arch=backend, default_fp=ti.f32)
@@ -198,7 +199,7 @@ WATER_WAVE_SPEED = 1.0          # multiplier applied to the "time" fed into the 
                                  # ripple function when rendering video -- 0 = water stays
                                  # still like before, 1 = default speed, higher = faster
                                  # "running" ripples. Edit directly.
-WATER_ANIMATE_CAUSTICS = True   # whether to recompute the caustic map (the light patterns
+WATER_ANIMATE_CAUSTICS = False   # whether to recompute the caustic map (the light patterns
                                  # under water) in step with the ripples when rendering video
                                  # (recomputing EVERY frame would be very slow, so it's only
                                  # redone every WATER_CAUSTIC_UPDATE_INTERVAL video-seconds)
@@ -1646,24 +1647,56 @@ def _shortest_angle_diff(a, b):
 
 
 class CameraKeyframe:
-    __slots__ = ("pos", "yaw", "pitch", "speed")
+    __slots__ = ("pos", "yaw", "pitch", "speed", "duration")
 
-    def __init__(self, pos, yaw, pitch, speed=1.0):
+    def __init__(self, pos, yaw, pitch, speed=1.0, duration=None):
         self.pos = np.array(pos, dtype=np.float32)
         self.yaw = float(yaw)
         self.pitch = float(pitch)
         self.speed = max(0.01, float(speed))  # world units / second
+        # Explicit duration (seconds) for the segment ENDING at this keyframe,
+        # overriding the distance/speed calculation below -- the only way to
+        # get a non-instant segment when the position doesn't change (a
+        # "hold" -- see CameraPath.hold()), and also handy any time you just
+        # want "this transition takes exactly N seconds" regardless of how
+        # far apart the two keyframes are.
+        self.duration = None if duration is None else max(1e-4, float(duration))
 
     def to_dict(self):
-        return {'pos': [float(x) for x in self.pos], 'yaw': self.yaw,
-                'pitch': self.pitch, 'speed': self.speed}
+        d = {'pos': [float(x) for x in self.pos], 'yaw': self.yaw,
+             'pitch': self.pitch, 'speed': self.speed}
+        if self.duration is not None:
+            d['duration'] = self.duration
+        return d
+
+
+def _kick(x):
+    """Sharp single-lobe "impact" shape used for footstep jolts: fast rise,
+    fast decay, peak of 1.0 at x=1/12, ~0 by x=0.5. x is expected in [0, 1)
+    (progress through one footfall's cycle)."""
+    return 32.6 * x * math.exp(-12.0 * x) if 0.0 <= x < 1.0 else 0.0
+
+
+def _smoothstep(edge0, edge1, x):
+    if edge1 <= edge0:
+        return 1.0 if x >= edge1 else 0.0
+    t = max(0.0, min(1.0, (x - edge0) / (edge1 - edge0)))
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _stride_length(speed):
+    """Full stride-cycle length (2 footfalls), world units -- grows with
+    speed the way a real gait's stride lengthens from a walk into a run."""
+    return max(0.9, min(3.1, 0.9 + 0.55 * min(speed, 4.0)))
 
 
 class CameraPath:
     """List of camera keyframes in creation order (P key appends). Does NOT
     store a "video duration" here -- duration is DERIVED from distance +
     speed (see total_duration/segment_durations), except with only 1
-    keyframe (nothing to move between) where VIDEO_DURATION is used."""
+    keyframe (nothing to move between) where VIDEO_DURATION is used. A
+    keyframe's `duration` field (see CameraKeyframe/hold()) overrides that
+    derivation for its segment."""
 
     def __init__(self):
         self.keyframes = []
@@ -1675,6 +1708,14 @@ class CameraPath:
         # or where the path "ends up" -- only how it wobbles along the way.
         self.handheld_shake = 0.0
         self.handheld_seed = 0.0
+        # Master multiplier for the FOOTSTEP-driven shake specifically (see
+        # _gait_offset) -- separate dial from handheld_shake so you can turn
+        # the constant idle micro-jitter up/down without changing how hard
+        # footsteps hit, or vice versa. Footstep shake only ever appears
+        # when handheld_shake > 0 too (it scales both together) since a
+        # "locked off" camera shouldn't develop footstep jolts just because
+        # it's moving fast.
+        self.footstep_shake = 1.0
 
     def _handheld_offset(self, t):
         """Deterministic (no RNG -- see note below), multi-frequency
@@ -1686,7 +1727,10 @@ class CameraPath:
         render_video samples several sub-frame times per output frame for
         motion blur, and interactive replay scrubs t directly -- both need
         the SAME wobble for the SAME t every time, which a stateful RNG
-        can't give without extra bookkeeping."""
+        can't give without extra bookkeeping. This is the "idle" component
+        that's present even standing still (real OIS/handheld footage never
+        holds perfectly steady); see _gait_offset for the much sharper,
+        speed-driven footstep component layered on top of it while moving."""
         amp = self.handheld_shake
         pos_off = np.zeros(3, dtype=np.float32)
         yaw_off = pitch_off = roll_off = 0.0
@@ -1706,9 +1750,87 @@ class CameraPath:
             pos_off[2] = amp * (0.012 * n(1.4, s + 2.6))
         return pos_off, yaw_off, pitch_off, roll_off
 
-    def add(self, pos, yaw, pitch, speed=1.0):
-        self.keyframes.append(CameraKeyframe(pos, yaw, pitch, speed))
+    def _gait_offset(self, t, speed, phase):
+        """Footstep-driven camera shake, layered ON TOP of _handheld_offset's
+        constant idle sway. Real handheld/body-worn footage gets a much
+        sharper jolt each time a foot hits the ground while moving: a quick
+        downward dip + a downward pitch "nod", roll that alternates
+        left/right with alternating footfalls, and -- once fast enough to
+        blend into a run -- a wider side-to-side arc sway (from arm swing)
+        plus a slower roll "drift" that doesn't fully recenter between
+        steps (fighting to keep the shot level while running).
+
+        t: absolute path time (seconds) -- only used for the slow run-drift
+           terms below, which aren't step-locked.
+        speed: the CURRENT segment's speed (world units/second). 0 during a
+           hold -- footsteps stop immediately, exactly like standing still.
+        phase: cumulative fractional STRIDE count so far (see sample()) --
+           phase advancing by 1.0 is one full left+right stride cycle, by
+           0.5 is a single footfall.
+        """
+        intensity = self.handheld_shake * self.footstep_shake
+        pos_off = np.zeros(3, dtype=np.float32)
+        yaw_off = pitch_off = roll_off = 0.0
+        if intensity <= 1e-6 or speed <= 1e-4:
+            return pos_off, yaw_off, pitch_off, roll_off
+
+        activity = _smoothstep(0.15, 1.1, speed)   # 0 standing -> 1 once walking-paced
+        if activity <= 1e-6:
+            return pos_off, yaw_off, pitch_off, roll_off
+        run_blend = _smoothstep(1.7, 3.3, speed)   # 0 walking -> 1 once running-paced
+        amp = intensity * activity
+
+        step_f = phase * 2.0                        # 1.0 per footfall (2 per stride cycle)
+        step_idx = math.floor(step_f)
+        within_step = step_f - step_idx              # 0..1 progress since this footfall
+        impact = _kick(within_step)
+        foot_sign = 1.0 if (int(step_idx) % 2 == 0) else -1.0
+        s = self.handheld_seed
+
+        vert = 0.03 * (1.0 + 1.6 * run_blend)
+        pos_off[1] = -amp * vert * impact                   # sharp dip at each footfall
+
+        pitch = 0.024 * (1.0 + 1.3 * run_blend)
+        pitch_off = -amp * pitch * impact                   # quick downward "nod" at footfall
+
+        roll_step = 0.022 * (1.0 + 1.7 * run_blend)
+        roll_off = amp * foot_sign * roll_step * impact      # alternating lean, opposite each foot
+
+        lateral = 0.045 * (1.0 + 2.4 * run_blend)
+        pos_off[0] = amp * lateral * math.sin(phase * 2.0 * math.pi)  # arc sway from arm swing
+
+        fwd = 0.014 * (1.0 + 1.2 * run_blend)
+        pos_off[2] = -amp * fwd * impact                     # tiny forward jerk on impact
+
+        if run_blend > 1e-4:
+            # Slower, not step-locked -- the horizon visibly wanders instead
+            # of snapping back to level every step, like actually straining
+            # to keep a shot steady while running.
+            drift = 0.05 * run_blend * amp
+            roll_off += drift * math.sin(t * 0.9 + s * 3.1)
+            yaw_off += 0.012 * run_blend * amp * math.sin(t * 0.7 + s * 1.3)
+
+        return pos_off, yaw_off, pitch_off, roll_off
+
+    def add(self, pos, yaw, pitch, speed=1.0, duration=None):
+        self.keyframes.append(CameraKeyframe(pos, yaw, pitch, speed, duration))
         return self.keyframes[-1]
+
+    def hold(self, duration=2.0, yaw=None, pitch=None):
+        """Convenience for "stay right here for `duration` seconds"
+        (optionally turning to a new yaw/pitch during the hold -- e.g.
+        panning to look at something while standing still, since only the
+        POSITION is held fixed). Just appends a keyframe at the same
+        position as the current last keyframe with an explicit duration --
+        position doesn't change, so the normal distance/speed timing (which
+        would give a 0-length segment) doesn't apply; footstep shake also
+        naturally stops during a hold, since its speed is 0 by construction."""
+        if not self.keyframes:
+            raise ValueError("hold() needs at least one keyframe already in the path (nothing to hold at).")
+        last = self.keyframes[-1]
+        new_yaw = last.yaw if yaw is None else float(yaw)
+        new_pitch = last.pitch if pitch is None else float(pitch)
+        return self.add(last.pos.copy(), new_yaw, new_pitch, speed=last.speed, duration=duration)
 
     def is_camera_data(self):
         return False
@@ -1721,13 +1843,18 @@ class CameraPath:
         self.keyframes.clear()
 
     def segment_durations(self):
-        """Duration (seconds) of each segment between 2 consecutive keyframes
-        = distance / speed of the STARTING keyframe of that segment."""
+        """Duration (seconds) of each segment between 2 consecutive
+        keyframes. Normally distance / speed of the STARTING keyframe of
+        that segment; if the ENDING keyframe has an explicit `duration` set
+        (see CameraKeyframe/hold()), that's used directly instead."""
         durs = []
         for i in range(len(self.keyframes) - 1):
             a, b = self.keyframes[i], self.keyframes[i + 1]
-            dist = float(np.linalg.norm(b.pos - a.pos))
-            durs.append(dist / a.speed)
+            if b.duration is not None:
+                durs.append(b.duration)
+            else:
+                dist = float(np.linalg.norm(b.pos - a.pos))
+                durs.append(dist / a.speed)
         return durs
 
     def total_duration(self):
@@ -1736,40 +1863,61 @@ class CameraPath:
     def sample(self, t):
         """t (seconds from the start of the path) -> (pos np.float32[3], yaw, pitch, roll)
         LINEARLY interpolated along the path. With only 1 keyframe, always
-        returns that keyframe (camera stays still). Returns None if the path is empty.
-        roll is always 0.0 here -- plain camera-keyframe paths carry no roll
-        (see SensorCameraData for --camera-data paths, which do)."""
+        returns that keyframe (camera stays still). Returns None if the path
+        is empty. Handheld sway (_handheld_offset) and, once actually
+        moving, footstep shake (_gait_offset) are both added on top of the
+        plain interpolated pose -- see their docstrings."""
         n = len(self.keyframes)
         if n == 0:
             return None
         if n == 1:
             kf = self.keyframes[0]
             pos_off, yaw_off, pitch_off, roll_off = self._handheld_offset(t)
-            return kf.pos.copy() + pos_off, kf.yaw + yaw_off, kf.pitch + pitch_off, roll_off
+            gpos, gyaw, gpitch, groll = self._gait_offset(t, 0.0, 0.0)
+            return (kf.pos.copy() + pos_off + gpos, kf.yaw + yaw_off + gyaw,
+                    kf.pitch + pitch_off + gpitch, roll_off + groll)
 
         durs = self.segment_durations()
         total = sum(durs)
         t_clamped = max(0.0, min(t, total))
         acc = 0.0
+        # Cumulative fractional STRIDE count, built up segment-by-segment as
+        # we scan for the one containing t_clamped -- each segment's own
+        # (constant, since interpolation within a segment is linear-in-time)
+        # speed determines its own stride length (_stride_length), so gait
+        # tempo changes naturally with how fast a given segment is moving.
+        # A held segment (0 distance/explicit duration -- see hold()) has
+        # speed 0 and contributes nothing, so footsteps correctly pause
+        # during a hold.
+        phase_acc = 0.0
         for i, d in enumerate(durs):
+            a, b = self.keyframes[i], self.keyframes[i + 1]
+            seg_len = float(np.linalg.norm(b.pos - a.pos))
+            seg_speed = seg_len / d if d > 1e-9 else 0.0
+            seg_stride = _stride_length(seg_speed)
             last = (i == len(durs) - 1)
             if t_clamped <= acc + d or last:
                 local_t = (t_clamped - acc) / d if d > 1e-9 else 1.0
                 local_t = max(0.0, min(1.0, local_t))
-                a, b = self.keyframes[i], self.keyframes[i + 1]
                 pos = a.pos + (b.pos - a.pos) * local_t
                 yaw = a.yaw + _shortest_angle_diff(a.yaw, b.yaw) * local_t
                 pitch = a.pitch + (b.pitch - a.pitch) * local_t
+                phase_acc += (local_t * seg_len) / seg_stride if seg_stride > 1e-6 else 0.0
                 # Handheld shake is evaluated at the UN-clamped t (not
                 # t_clamped) so it keeps evolving smoothly even if a caller
                 # samples slightly past the path's end -- only matters at
                 # the boundary, keeps the wobble continuous there.
                 pos_off, yaw_off, pitch_off, roll_off = self._handheld_offset(t)
-                return pos + pos_off, float(yaw) + yaw_off, float(pitch) + pitch_off, roll_off
+                gpos, gyaw, gpitch, groll = self._gait_offset(t, seg_speed, phase_acc)
+                return (pos + pos_off + gpos, float(yaw) + yaw_off + gyaw,
+                        float(pitch) + pitch_off + gpitch, roll_off + groll)
+            phase_acc += seg_len / seg_stride if seg_stride > 1e-6 else 0.0
             acc += d
         kf = self.keyframes[-1]
         pos_off, yaw_off, pitch_off, roll_off = self._handheld_offset(t)
-        return kf.pos.copy() + pos_off, kf.yaw + yaw_off, kf.pitch + pitch_off, roll_off
+        gpos, gyaw, gpitch, groll = self._gait_offset(t, 0.0, phase_acc)
+        return (kf.pos.copy() + pos_off + gpos, kf.yaw + yaw_off + gyaw,
+                kf.pitch + pitch_off + gpitch, roll_off + groll)
 
     def to_list(self):
         return [kf.to_dict() for kf in self.keyframes]
@@ -1778,7 +1926,8 @@ class CameraPath:
     def from_list(items):
         cp = CameraPath()
         for kf in items:
-            cp.add(kf['pos'], kf.get('yaw', 0.0), kf.get('pitch', 0.0), kf.get('speed', 1.0))
+            cp.add(kf['pos'], kf.get('yaw', 0.0), kf.get('pitch', 0.0),
+                    kf.get('speed', 1.0), kf.get('duration'))
         return cp
 
 
@@ -1955,9 +2104,9 @@ class LiveCameraStream:
                 s = json.loads(data.decode('utf-8'))
                 p = s['pos']; r = s['rot']
                 pos = (np.array([p['x'], p['y'], p['z']], dtype=np.float32) * self.multiplier) + self.offset
-                pitch = math.radians(r['y'])
-                yaw = math.radians(r['x'])
-                roll = math.radians(r['z'])
+                pitch = math.radians(r['z'])
+                yaw = math.radians(r['y'])
+                roll = math.radians(r['x'])
                 now = time.time()
                 if self._start_wall is None:
                     self._start_wall = now
@@ -3368,6 +3517,7 @@ def save_scene_file(path, scene: Scene, tracer: RayTracer, post_fx=None,
         'camera_path': camera_path.to_list() if camera_path is not None else [],
         'handheld_shake': camera_path.handheld_shake if camera_path is not None else 0.0,
         'handheld_seed': camera_path.handheld_seed if camera_path is not None else 0.0,
+        'footstep_shake': camera_path.footstep_shake if camera_path is not None else 1.0,
         'scene': scene.to_dict(assets=assets),
     }
     if assets is not None:
@@ -3415,6 +3565,7 @@ def load_scene_file(path):
     camera_path = CameraPath.from_list(data.get('camera_path', []))
     camera_path.handheld_shake = data.get('handheld_shake', 0.0)
     camera_path.handheld_seed = data.get('handheld_seed', 0.0)
+    camera_path.footstep_shake = data.get('footstep_shake', 1.0)
 
     return {
         'scene': scene, 'camera': data.get('camera', {'pos': [0, 6, -30], 'yaw': 0.0, 'pitch': 0.0}),
@@ -3808,8 +3959,20 @@ def keyframe_options_menu_cv(canvas, sw, sh, kf, idx):
 # =============================================================================
 
 def _parse_wh(s):
-    w, h = s.lower().split('x')
-    return int(w), int(h)
+    """Parses a WIDTHxHEIGHT resolution string. Accepts 'x'/'X' (the
+    documented format, e.g. '1920x1080'), but also ',' or whitespace as a
+    separator (e.g. '1920,1080' or '1920 1080') since that's an easy typo
+    to make coming from other tools -- gives a clear error either way."""
+    parts = re.split(r'[xX,\s]+', s.strip())
+    parts = [p for p in parts if p]
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(
+            f"invalid resolution '{s}' -- expected WIDTHxHEIGHT, e.g. 1920x1080")
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid resolution '{s}' -- expected WIDTHxHEIGHT, e.g. 1920x1080")
 
 
 def parse_args(argv=None):
@@ -3873,6 +4036,11 @@ def parse_args(argv=None):
                     help="Adds fake handheld camera sway/jitter on top of camera KEYFRAME paths "
                          "(P/O/9 -- ignored for --camera-data/--camera-stream, which already carry "
                          "real motion). 0 = off, ~0.3-0.6 = handheld, higher = walking/running.")
+    p.add_argument('--footstep-shake', type=float, default=None,
+                    help="Master multiplier on the FOOTSTEP-driven component of --handheld-shake "
+                         "specifically (the sharper per-step jolt/nod/lean while actually moving, "
+                         "vs. the constant idle sway) -- 1.0 (default) = normal, 0 = idle sway only, "
+                         ">1 = exaggerated footsteps. Has no effect if --handheld-shake is 0.")
     return p.parse_args(argv)
 
 
@@ -3931,8 +4099,8 @@ def main(argv=None):
         bg = Background(color=(20, 25, 35), image_path="sky.png", brightness=1.0)
         lights = [
             Light((-18.41, 29.48, -12.73), (255, 251, 235), 2.1),   # key light, slightly warm
-            Light((-1.47, -4.69, 6.94), (128, 202, 235), 1.0),      # fill light, cooler blue
-            Light((-5.88, 16.79, -13.09), (255, 251, 235), 0.3),
+            #Light((-1.47, -4.69, 6.94), (128, 202, 235), 1.0),      # fill light, cooler blue
+            #Light((-5.88, 16.79, -13.09), (255, 251, 235), 0.3),
         ]
         spotlights = []
         fov = 65
@@ -3971,6 +4139,8 @@ def main(argv=None):
     # into camera_path -- exactly as requested.
     if args.handheld_shake:
         camera_path.handheld_shake = float(args.handheld_shake)
+    if args.footstep_shake is not None:
+        camera_path.footstep_shake = float(args.footstep_shake)
 
     sensor_data = None
     stream_data = None    # LiveCameraStream (--camera-stream) -- see its docstring
@@ -4088,13 +4258,14 @@ def main(argv=None):
     print(", / . : roll camera left/right | / : reset roll to 0")
     if is_live_stream:
         print(f"Live camera stream active on {stream_data.host}:{stream_data.port} -- camera "
-              f"keyframes (P/O) are disabled; I follows the live pose directly (no fixed replay "
+              f"keyframes (P/O/J) are disabled; I follows the live pose directly (no fixed replay "
               f"length -- press I again to stop following).")
     elif has_camera_data:
-        print(f"Camera data loaded ({_camera_data_count_str()}) -- camera keyframes (P/O) "
+        print(f"Camera data loaded ({_camera_data_count_str()}) -- camera keyframes (P/O/J) "
               f"are disabled; I replays the sensor recording (roll resets to 0 when it ends/stops).")
     else:
-        print("P: add a camera keyframe here | O: edit/delete the targeted keyframe (nearest to crosshair)")
+        print("P: add a camera keyframe here | J: add a HOLD keyframe (stay put, can still turn) | "
+              "O: edit/delete the targeted keyframe (nearest to crosshair)")
     print("I: replay the camera path (no render) | 9: render VIDEO along the path")
     print("X: export the current scene/camera/lights/etc to a .json file | Esc: quit")
 
@@ -4280,6 +4451,22 @@ def main(argv=None):
                 else:
                     camera_path.add(camera_pos.copy(), camera_rot[0], camera_rot[1], speed=1.0)
                     print(f"Camera keyframe #{len(camera_path.keyframes)} added.")
+            elif ch == 'j' and inp.one_shot('add_hold_keyframe'):
+                if has_camera_data:
+                    print("Camera keyframes are disabled while --camera-data is active.")
+                elif not camera_path.keyframes:
+                    print("Add a normal keyframe first (P), then J to hold in place at that position.")
+                else:
+                    try:
+                        raw_in = input("Hold duration in seconds (camera stays put, can still turn "
+                                        "-- Enter for 2.0): ").strip()
+                        dur = float(raw_in) if raw_in else 2.0
+                    except (ValueError, EOFError):
+                        print("Invalid value -- using 2.0s.")
+                        dur = 2.0
+                    camera_path.hold(duration=max(0.05, dur), yaw=camera_rot[0], pitch=camera_rot[1])
+                    print(f"Hold keyframe #{len(camera_path.keyframes)} added ({dur:.2f}s, "
+                          f"view angle set to the current camera).")
             elif ch == 'o' and inp.one_shot('kf_menu'):
                 if has_camera_data:
                     print("Camera keyframes are disabled while --camera-data is active.")
