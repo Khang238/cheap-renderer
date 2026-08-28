@@ -60,6 +60,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 import cv2
@@ -87,16 +88,58 @@ def _gpu_smoke_test():
 
 
 def init_taichi():
-    for backend in [ti.cuda, ti.cpu]:   # GPU (opengl/vulkan) skipped -- older GPUs (e.g. Haswell iGPU)
-        name = str(backend).split('.')[-1]      # don't support the features Taichi needs here.
+    """Picks a Taichi backend and starts it -- tries real GPU backends first
+    (much faster), falling back to CPU if none of them work (e.g. an old
+    iGPU that doesn't support what Taichi needs here, or no GPU at all).
+
+    Two environment variables (NOT CLI flags) can override this:
+      RT_BACKEND      -- force one specific backend ('cuda', 'vulkan',
+                          'metal', or 'cpu') instead of auto-trying in order.
+                          Used by --multi-gpu worker processes (see
+                          _spawn_mgpu_worker) to force 'cuda' on their
+                          pinned GPU rather than re-running the full
+                          auto-detect probe in every worker; also handy to
+                          force 'cpu' yourself for debugging, e.g.:
+                              RT_BACKEND=cpu python3 rfv10cv.py --scene foo.json ...
+      RT_RANDOM_SEED  -- seeds Taichi's RNG explicitly. Used so --multi-gpu
+                          still-image workers (which each independently
+                          render an INDEPENDENT share of the total sample
+                          count for the SAME image) don't all draw the exact
+                          same "random" jitter/scatter sequence -- which
+                          would just duplicate noise instead of actually
+                          reducing it once their results are combined.
+    These are env vars and not argparse flags because this function has to
+    run at IMPORT time, before argparse (or even main()) exists -- the
+    @ti.kernel/@ti.func definitions later in this file need an active
+    Taichi runtime to be defined against, so this can't be deferred."""
+    forced = os.environ.get('RT_BACKEND', '').strip().lower()
+    seed_env = os.environ.get('RT_RANDOM_SEED', '').strip()
+    seed = int(seed_env) if seed_env else None
+
+    backends = {'cuda': ti.cuda, 'vulkan': ti.vulkan, 'metal': ti.metal, 'cpu': ti.cpu}
+    if forced in backends:
+        order = [(forced, backends[forced])]
+    else:
+        # GPU backends first (much faster when available); CPU last as the
+        # universal fallback (this is what the older, CPU-only version of
+        # this function always used, kept as the safety net for hardware
+        # that doesn't support Taichi's GPU backends).
+        order = [('cuda', ti.cuda), ('vulkan', ti.vulkan), ('metal', ti.metal), ('cpu', ti.cpu)]
+
+    last_err = None
+    for name, backend in order:
         try:
-            ti.init(arch=backend, default_fp=ti.f32)
+            kwargs = {'arch': backend, 'default_fp': ti.f32}
+            if seed is not None:
+                kwargs['random_seed'] = seed
+            ti.init(**kwargs)
             _gpu_smoke_test()
             print(f"Taichi backend: {name}")
             return name
         except Exception as e:
+            last_err = e
             print(f"{name} failed: {e}")
-    raise RuntimeError("Could not start Taichi on any backend")
+    raise RuntimeError(f"Could not start Taichi on any backend (last error: {last_err})")
 
 
 BACKEND = init_taichi()
@@ -1429,16 +1472,17 @@ def render_sample(
         throughput = vec3(1.0)
         final_color = vec3(0.0)
         terminated = False
+        depth_written = False
 
         for bounce in range(max_bounce + 1):
             if terminated:
                 continue
             tid, t, bu, bv = _bvh_closest_hit(ray_o, ray_dir, 1e18)
 
-            if bounce == 0:
-                DEPTH_ACCUM[py, px] += t if tid >= 0 else 1.0e4
-
             if tid < 0:
+                if not depth_written:
+                    DEPTH_ACCUM[py, px] += 1.0e4
+                    depth_written = True
                 final_color += throughput * _sample_background(ray_dir) * bg_brightness
                 terminated = True
                 continue
@@ -1457,9 +1501,26 @@ def render_sample(
                 tex_alpha = tex_color_alpha[3]  # the image's alpha value (0.0 -> 1.0)
 
             if tex_alpha < 0.1:
-                # A transparent region of the image! Push the ray origin through this plane.
+                # A transparent region of the image! Push the ray origin
+                # through this plane WITHOUT recording depth here -- an
+                # alpha-cutout pixel isn't really "there", so the depth
+                # buffer (which DoF uses for its blur radius) should reflect
+                # whatever is actually visible once the ray keeps going
+                # (the real background/geometry behind it), not this
+                # transparent quad's own (usually much nearer) distance.
+                # Recording depth unconditionally at bounce 0 here used to
+                # be exactly why DoF left a sharp, unblurred rectangle
+                # showing an image plane's full bounding box: the see-
+                # through parts kept that near depth and were treated as
+                # "in focus" even though the color actually shown there
+                # comes from something far behind it.
                 ray_o = p + ray_dir * 1e-3
                 continue  # move on to the next bounce without stopping the ray here
+
+            if not depth_written:
+                DEPTH_ACCUM[py, px] += t
+                depth_written = True
+
             rough = F_ROUGH[tid]
             transp = F_TRANSP[tid]
             ior = F_IOR[tid]
@@ -2152,6 +2213,28 @@ class LiveCameraStream:
 #     see item 5 in the module docstring for why this matters.
 # =============================================================================
 
+def _compute_video_frame_plan(camera_path, fps, duration, camera_sync):
+    """Returns (n_frames, frame_times_or_None, total_time, camera_sync) --
+    the same frame-count/timing logic render_video() uses to decide how
+    many frames a video will have, factored out so the --multi-gpu video
+    orchestrator (_run_multi_gpu_video) can compute frame-block boundaries
+    WITHOUT actually rendering anything."""
+    is_sensor = camera_path.is_camera_data()
+    n_kf = 0 if is_sensor else len(camera_path.keyframes)
+    if is_sensor:
+        total_time = max(1e-3, camera_path.total_duration())
+    else:
+        total_time = duration if n_kf == 1 else max(1e-3, camera_path.total_duration())
+    camera_sync = camera_sync and is_sensor
+    if camera_sync:
+        frame_times = camera_path.timestamps()
+        n_frames = len(frame_times)
+    else:
+        n_frames = max(1, int(round(total_time * fps)))
+        frame_times = None
+    return n_frames, frame_times, total_time, camera_sync
+
+
 class RayTracer:
     def __init__(self, scene: Scene, width=480, height=480, fov=60,
                  max_bounce=DEFAULT_MAX_BOUNCE, background=None, lights=None, spotlights=None,
@@ -2394,6 +2477,47 @@ class RayTracer:
         color, _ = self.current_image_float()
         return (color * 255).astype(np.uint8)
 
+    def load_accum(self, accum_np, depth_accum_np, n_samples):
+        """Loads EXTERNALLY-combined accumulation buffers into this
+        tracer's fields, standing in for actually having called
+        add_samples() here. Used ONLY by the --multi-gpu still-image
+        orchestrator (_run_multi_gpu_still), which sums each worker GPU's
+        raw ACCUM/DEPTH_ACCUM (each worker independently accumulated its
+        own share of the total sample count) before calling this, so the
+        combined result can be resolved/tonemapped/post-processed exactly
+        once, here, instead of once per worker."""
+        padded_accum = np.zeros((MAX_H, MAX_W, 3), dtype=np.float32)
+        padded_accum[:self.height, :self.width] = accum_np
+        padded_depth = np.zeros((MAX_H, MAX_W), dtype=np.float32)
+        padded_depth[:self.height, :self.width] = depth_accum_np
+        ACCUM.from_numpy(padded_accum)
+        DEPTH_ACCUM.from_numpy(padded_depth)
+        SAMPLE_COUNT[None] = int(n_samples)
+
+    def dump_raw_accum(self):
+        """Raw (pre-tonemap) ACCUM/DEPTH_ACCUM + the current SAMPLE_COUNT,
+        sliced to this tracer's active resolution. Used ONLY by --multi-gpu
+        still-image WORKERS to hand their independently-accumulated share
+        of samples back to the orchestrator (see load_accum, the combining
+        side, in the parent process)."""
+        accum_np = ACCUM.to_numpy()[:self.height, :self.width]
+        depth_np = DEPTH_ACCUM.to_numpy()[:self.height, :self.width]
+        return accum_np, depth_np, int(SAMPLE_COUNT[None])
+
+    def finalize_and_save(self, out_path, post_fx=None):
+        """Resolve -> post-fx -> save, with no sampling of its own. Split
+        out of render_to_file so the --multi-gpu still-image path (which
+        combines several workers' ACCUM buffers via load_accum() instead
+        of calling add_samples itself) can reuse the exact same
+        resolve/post-processing/save logic without duplicating it."""
+        color, depth = self.current_image_float()
+        if post_fx and post_fx.get('enabled', True):
+            R = camera_matrix(*self.camera_rot, self.camera_roll)
+            flares = compute_flare_list(self, self.camera_pos, R)
+            color = apply_post_processing(color, depth, flares, post_fx)
+        img = (np.clip(color, 0.0, 1.0) * 255).astype(np.uint8)
+        Image.fromarray(img).save(out_path)
+
     def render_to_file(self, out_path="raytrace_v9.png", samples=32, post_fx=None,
                        batch=4, progress_cb=None):
         """progress_cb (if given) is called after EVERY batch of samples with
@@ -2415,19 +2539,13 @@ class RayTracer:
                   f"elapsed {elapsed:6.1f}s  ETA {eta:6.1f}s", end="", flush=True)
             if progress_cb is not None:
                 progress_cb(done, samples, elapsed, eta)
-        color, depth = self.current_image_float()
-        if post_fx and post_fx.get('enabled', True):
-            R = camera_matrix(*self.camera_rot, self.camera_roll)
-            flares = compute_flare_list(self, self.camera_pos, R)
-            color = apply_post_processing(color, depth, flares, post_fx)
-        img = (np.clip(color, 0.0, 1.0) * 255).astype(np.uint8)
-        Image.fromarray(img).save(out_path)
+        self.finalize_and_save(out_path, post_fx=post_fx)
         print(f"\nSaved: {out_path} ({time.time() - t0:.2f}s)")
 
     def render_video(self, camera_path, out_path="raytrace_v9_video.mp4",
                       fps=VIDEO_FPS, resolution=VIDEO_RES, duration=VIDEO_DURATION,
                       samples_per_frame=VIDEO_SAMPLES_PER_FRAME, post_fx=None,
-                      progress_cb=None, camera_sync=False):
+                      progress_cb=None, camera_sync=False, frame_subset=None, skip_encode=False):
         """Renders a video following camera_path, which is EITHER a CameraPath
         (hand-placed camera keyframes) OR a SensorCameraData (--camera-data):
           - CameraPath, 0 keyframes -> does nothing (safety net; main() already
@@ -2452,27 +2570,29 @@ class RayTracer:
         (no shutter window to sample across), so motion blur is skipped for them.
         Water (if the scene has scene.add_water(...)) will RIPPLE OVER TIME
         (WATER_WAVE_SPEED) during video rendering -- stills (render_to_file)
-        and the live raytrace view still stay still, since they never pass this time value."""
+        and the live raytrace view still stay still, since they never pass this time value.
+
+        frame_subset (--multi-gpu video worker use ONLY): an iterable of frame
+        indices to actually render -- every OTHER frame index in range(n_frames)
+        is skipped entirely (not even sampled for timing). Meant for a
+        CONTIGUOUS range (e.g. range(0, 40)), one per GPU -- see the
+        _run_multi_gpu_video/_compute_video_frame_plan module note for why
+        contiguous blocks (not interleaved frames) are used and what that
+        costs (eye-adaptation/autofocus lag start "cold" at each block's
+        first frame, same as they would at the very start of a normal render).
+        skip_encode: if True, don't run ffmpeg at the end (the --multi-gpu
+        orchestrator does that once, after ALL workers/blocks are done)."""
         is_sensor = camera_path.is_camera_data()
         n_kf = 0 if is_sensor else len(camera_path.keyframes)
         if not is_sensor and n_kf == 0:
             print("No camera keyframes -- cancelling video render.")
             return None
 
-        if is_sensor:
-            total_time = max(1e-3, camera_path.total_duration())
-        else:
-            total_time = duration if n_kf == 1 else max(1e-3, camera_path.total_duration())
-
-        camera_sync = camera_sync and is_sensor
-        if camera_sync:
-            frame_times = camera_path.timestamps()
-            n_frames = len(frame_times)
-        else:
-            n_frames = max(1, int(round(total_time * fps)))
-            frame_times = None
+        n_frames, frame_times, total_time, camera_sync = _compute_video_frame_plan(
+            camera_path, fps, duration, camera_sync)
         frames_dir = os.path.splitext(out_path)[0] + "_frames"
         os.makedirs(frames_dir, exist_ok=True)
+        frame_range = range(n_frames) if frame_subset is None else list(frame_subset)
 
         post_fx = post_fx if post_fx is not None else dict(DEFAULT_POST_FX)
         motion_blur = (not camera_sync) and (n_kf > 1 or is_sensor) and bool(post_fx.get('motion_blur_enabled', False))
@@ -2503,10 +2623,12 @@ class RayTracer:
         last_caustic_t = None
 
         sync_note = " (camera-sync: 1 frame/sample)" if camera_sync else ""
+        n_render = len(frame_range)
+        subset_note = f" [{n_render}/{n_frames} frames, this worker's block]" if frame_subset is not None else ""
         print(f"Rendering video {resolution[0]}x{resolution[1]}, {n_frames} frames "
-              f"({total_time:.2f}s @ {fps}fps), {samples_per_frame} sample(s)/frame{sync_note} ...")
+              f"({total_time:.2f}s @ {fps}fps), {samples_per_frame} sample(s)/frame{sync_note}{subset_note} ...")
         t0 = time.time()
-        for fi in range(n_frames):
+        for ri, fi in enumerate(frame_range):
             t_center = frame_times[fi] if camera_sync else min((fi + 0.5) * dt, total_time)
             self.reset_accumulation()
 
@@ -2560,12 +2682,12 @@ class RayTracer:
             Image.fromarray(img).save(os.path.join(frames_dir, f"frame_{fi:05d}.png"))
 
             elapsed = time.time() - t0
-            frac_done = (fi + 1) / n_frames
+            frac_done = (ri + 1) / n_render
             eta = (elapsed / frac_done - elapsed) if frac_done > 0 else 0.0
             print(f"\r  Frame {fi + 1}/{n_frames}  {frac_done * 100:5.1f}%  "
                   f"elapsed {elapsed:6.1f}s  ETA {eta:6.1f}s", end="", flush=True)
             if progress_cb is not None:
-                progress_cb(fi + 1, n_frames, elapsed, eta)
+                progress_cb(ri + 1, n_render, elapsed, eta)
 
         self.eye_adapt_enabled = do_eye_adapt
         self.set_resolution(prev_w, prev_h)
@@ -2574,8 +2696,12 @@ class RayTracer:
         WATER_TIME[None] = 0.0
         if animate_caustics:
             self.compute_caustics()  # restore the still (t=0) caustic map, as before rendering video
-        print(f"\nRendered {n_frames} frames into: {frames_dir}")
+        print(f"\nRendered {n_render} frame(s) into: {frames_dir}")
 
+        if skip_encode:
+            # The --multi-gpu orchestrator handles encoding once, after ALL
+            # workers/blocks are done writing into frames_dir.
+            return frames_dir
         if _encode_video_ffmpeg(frames_dir, out_path, fps):
             print(f"Encoded video (ffmpeg): {out_path}")
             return out_path
@@ -2609,6 +2735,190 @@ def _encode_video_ffmpeg(frames_dir, out_path, fps):
     except Exception as e:
         print(f"\nError running ffmpeg: {e}")
         return False
+
+
+# =============================================================================
+# 11d) --multi-gpu orchestration
+#
+# Taichi doesn't support spreading a SINGLE kernel launch across multiple
+# GPUs -- one ti.init() binds to one device. So this works by launching N
+# separate OS processes (this same script, re-invoked with the ORIGINAL
+# command line plus hidden --_mgpu-* flags), pinning each one to a
+# different physical GPU via the CUDA_VISIBLE_DEVICES environment variable,
+# and combining their results afterward:
+#
+#   - STILL IMAGES: each worker renders the SAME image with an INDEPENDENT
+#     share of the total sample count (each GPU accumulates its own,
+#     uncorrelated noise -- see RT_RANDOM_SEED in init_taichi -- rather than
+#     splitting a single sample's work across GPUs, which would need much
+#     finer-grained cross-device synchronization for no real benefit at
+#     this granularity). The orchestrator sums every worker's raw
+#     ACCUM/DEPTH_ACCUM buffers and resolves/tonemaps/post-processes ONCE,
+#     in this process, via RayTracer.load_accum + finalize_and_save.
+#
+#   - VIDEO: each worker renders one CONTIGUOUS block of frames (start..end,
+#     not interleaved) so that per-frame temporal state -- eye adaptation
+#     (measure_target_exposure smoothing) and continuous autofocus lag --
+#     stays internally consistent within each worker's block (both use the
+#     real elapsed time between CONSECUTIVE rendered frames, which is only
+#     correct if consecutive output frames are actually adjacent in time;
+#     interleaving frames round-robin across GPUs would silently break that
+#     math). The tradeoff: each block starts that smoothing "cold" (default
+#     exposure/focus, same as the very start of any render), so there can
+#     be a brief, visible re-adjustment right at each seam between GPUs'
+#     blocks -- more GPUs means more (narrower) blocks, means more seams.
+#     Motion blur is unaffected either way (it only samples time WITHIN a
+#     single frame, never across frames).
+# =============================================================================
+
+def _detect_gpu_indices():
+    """NVIDIA GPU indices visible to nvidia-smi, or [] if it's not
+    available or fails (no NVIDIA GPU, missing/broken driver, etc.)."""
+    if shutil.which('nvidia-smi') is None:
+        return []
+    try:
+        out = subprocess.run(['nvidia-smi', '-L'], capture_output=True, text=True,
+                              timeout=10, check=True)
+    except (subprocess.SubprocessError, OSError):
+        return []
+    indices = []
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if line.startswith('GPU '):
+            try:
+                indices.append(int(line.split(':')[0].split()[1]))
+            except (IndexError, ValueError):
+                continue
+    return indices
+
+
+def _resolve_multi_gpu_indices(spec):
+    """Parses --multi-gpu's value into a concrete list of GPU indices to
+    use, or [] meaning "render normally, single process": 'off' (disabled),
+    'auto' (use all nvidia-smi-detected GPUs if there are 2+, otherwise
+    same as off), a bare integer ('3' -> GPUs 0,1,2), or an explicit
+    comma-separated list ('0,2,3', for picking specific GPUs or working
+    around a broken/undetectable one)."""
+    spec = (spec or 'auto').strip().lower()
+    if spec in ('off', 'none', ''):
+        return []
+    if ',' in spec:
+        try:
+            return [int(x) for x in spec.split(',') if x.strip() != '']
+        except ValueError:
+            print(f"Warning: couldn't parse --multi-gpu '{spec}' as a GPU index list -- disabling multi-GPU.")
+            return []
+    if spec.isdigit():
+        n = int(spec)
+        return list(range(n)) if n >= 2 else []
+    if spec == 'auto':
+        found = _detect_gpu_indices()
+        return found if len(found) >= 2 else []
+    print(f"Warning: unrecognized --multi-gpu value '{spec}' -- disabling multi-GPU.")
+    return []
+
+
+def _spawn_mgpu_worker(extra_args, gpu_index, seed):
+    """Launches one worker: this same script, the CURRENT process's
+    original command line (sys.argv[1:], whatever the user actually typed),
+    plus extra_args (the hidden --_mgpu-* flags telling it what slice of
+    work to do) -- pinned to physical GPU gpu_index via CUDA_VISIBLE_DEVICES
+    and seeded via RT_RANDOM_SEED (see init_taichi). Non-blocking (returns
+    the Popen handle) -- callers launch a whole batch of these before
+    waiting on any of them, so the GPUs actually run in parallel."""
+    env = os.environ.copy()
+    env['CUDA_VISIBLE_DEVICES'] = str(gpu_index)
+    env['RT_BACKEND'] = 'cuda'
+    env['RT_RANDOM_SEED'] = str(seed)
+    cmd = [sys.executable, os.path.abspath(__file__)] + sys.argv[1:] + extra_args
+    return subprocess.Popen(cmd, env=env)
+
+
+def _wait_mgpu_workers(procs):
+    rc = [p.wait() for p in procs]
+    if any(r != 0 for r in rc):
+        raise RuntimeError(f"One or more --multi-gpu worker processes exited with an error "
+                            f"(exit codes: {rc}) -- see their output above for the actual cause.")
+
+
+def _run_multi_gpu_still(gpu_indices, out_path, samples, post_fx, tracer):
+    """Orchestrates a still-image render across gpu_indices: splits `samples`
+    as evenly as possible (one share per GPU), waits for every worker to
+    finish rendering its independent share, sums their raw accumulation
+    buffers, and resolves/post-processes/saves ONCE, here."""
+    n = len(gpu_indices)
+    base, extra = divmod(samples, n)
+    shares = [base + (1 if i < extra else 0) for i in range(n)]
+    tmp_dir = tempfile.mkdtemp(prefix="rfv10cv_mgpu_")
+    print(f"Multi-GPU still render across {n} GPU(s) {gpu_indices}: sample split {shares}")
+    procs = []
+    out_paths = []
+    try:
+        for i, (gpu_idx, share) in enumerate(zip(gpu_indices, shares)):
+            if share <= 0:
+                continue
+            npz_path = os.path.join(tmp_dir, f"worker_{i}.npz")
+            out_paths.append(npz_path)
+            extra_args = ['--_mgpu-role', 'still', '--_mgpu-samples', str(share),
+                          '--_mgpu-out', npz_path]
+            seed = (os.getpid() * 7919 + gpu_idx * 104729 + i * 1000003) & 0x7fffffff
+            procs.append(_spawn_mgpu_worker(extra_args, gpu_idx, seed))
+        _wait_mgpu_workers(procs)
+
+        total_accum = None
+        total_depth = None
+        total_n = 0
+        for p in out_paths:
+            data = np.load(p)
+            a, d, n_s = data['accum'], data['depth_accum'], int(data['n'])
+            total_accum = a if total_accum is None else total_accum + a
+            total_depth = d if total_depth is None else total_depth + d
+            total_n += n_s
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    tracer.load_accum(total_accum, total_depth, total_n)
+    tracer.finalize_and_save(out_path, post_fx=post_fx)
+    print(f"Saved: {out_path} (combined {total_n} samples across {n} GPU(s))")
+
+
+def _run_multi_gpu_video(gpu_indices, out_path, fps, camera_sync, active_path, duration):
+    """Orchestrates a video render across gpu_indices: splits the frame
+    range into one CONTIGUOUS block per GPU (see the module note above for
+    why contiguous rather than interleaved), waits for every worker to
+    finish writing its block's frame_%05d.png files into the shared frames
+    directory, then encodes the video ONCE, here."""
+    n_frames, _frame_times, _total_time, _cs = _compute_video_frame_plan(
+        active_path, fps, duration, camera_sync)
+    n = len(gpu_indices)
+    base, extra = divmod(n_frames, n)
+    bounds = []
+    start = 0
+    for i in range(n):
+        count = base + (1 if i < extra else 0)
+        bounds.append((start, start + count))
+        start += count
+    frames_dir = os.path.splitext(out_path)[0] + "_frames"
+    os.makedirs(frames_dir, exist_ok=True)
+    print(f"Multi-GPU video render across {n} GPU(s) {gpu_indices}: "
+          f"{n_frames} frames split into contiguous blocks {bounds}")
+    procs = []
+    for i, (gpu_idx, (s, e)) in enumerate(zip(gpu_indices, bounds)):
+        if e <= s:
+            continue
+        extra_args = ['--_mgpu-role', 'video', '--_mgpu-start', str(s), '--_mgpu-end', str(e)]
+        seed = (os.getpid() * 7919 + gpu_idx * 104729 + i * 1000003) & 0x7fffffff
+        procs.append(_spawn_mgpu_worker(extra_args, gpu_idx, seed))
+    _wait_mgpu_workers(procs)
+
+    print(f"All {n} GPU(s) finished -- {n_frames} frames in: {frames_dir}")
+    if _encode_video_ffmpeg(frames_dir, out_path, fps):
+        print(f"Encoded video (ffmpeg): {out_path}")
+    else:
+        print(f"ffmpeg not found in PATH -- PNG frames are still in "
+              f"'{frames_dir}'. You can encode them yourself with:\n"
+              f"  ffmpeg -framerate {fps} -i {frames_dir}/frame_%05d.png "
+              f"-c:v libx264 -pix_fmt yuv420p {out_path}")
 
 
 class ProgressiveRenderer:
@@ -4041,6 +4351,24 @@ def parse_args(argv=None):
                          "specifically (the sharper per-step jolt/nod/lean while actually moving, "
                          "vs. the constant idle sway) -- 1.0 (default) = normal, 0 = idle sway only, "
                          ">1 = exaggerated footsteps. Has no effect if --handheld-shake is 0.")
+    p.add_argument('--multi-gpu', type=str, default='off',
+                    help="Split a --headless render across multiple NVIDIA GPUs in separate "
+                         "processes (Taichi can't span one kernel launch across GPUs -- see the "
+                         "module note above _run_multi_gpu_still for how this actually works). "
+                         "'off' (default): single process/GPU, as normal. 'auto': use every GPU "
+                         "nvidia-smi finds (only kicks in with 2+). A bare integer, e.g. '2': use "
+                         "that many GPUs (indices 0..N-1). An explicit list, e.g. '0,2,3': use "
+                         "exactly those GPU indices. Ignored outside --headless (interactive mode "
+                         "is inherently single-process/real-time).")
+    # --- Internal: --multi-gpu worker flags. Not meant to be set by hand --
+    # the orchestrator (_run_multi_gpu_still/_run_multi_gpu_video) adds
+    # these itself when it re-invokes this script as a worker process.
+    p.add_argument('--_mgpu-role', type=str, default=None, choices=['still', 'video'],
+                    help=argparse.SUPPRESS)
+    p.add_argument('--_mgpu-samples', type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument('--_mgpu-out', type=str, default=None, help=argparse.SUPPRESS)
+    p.add_argument('--_mgpu-start', type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument('--_mgpu-end', type=int, default=None, help=argparse.SUPPRESS)
     return p.parse_args(argv)
 
 
@@ -4054,6 +4382,47 @@ def _parse_xyz(s):
 # =============================================================================
 # 21) Main
 # =============================================================================
+
+def _do_still_render(tracer, args, post_fx, is_worker, mgpu_indices):
+    """Dispatches a still-image render 1 of 3 ways: as a --multi-gpu WORKER
+    (renders its assigned sample share, dumps raw accum to --_mgpu-out,
+    returns without saving an image), as the --multi-gpu ORCHESTRATOR
+    (spawns workers and combines their results -- see _run_multi_gpu_still),
+    or normally (single process, as before --multi-gpu existed)."""
+    tracer.set_resolution(*FINAL_RENDER_RES)
+    if is_worker:
+        print(f"[worker] Rendering {tracer.width}x{tracer.height}, "
+              f"{args._mgpu_samples} sample(s) (this GPU's share) ...")
+        tracer.reset_accumulation()
+        tracer.add_samples(args._mgpu_samples)
+        accum_np, depth_np, n = tracer.dump_raw_accum()
+        np.savez(args._mgpu_out, accum=accum_np, depth_accum=depth_np, n=n)
+        print(f"[worker] Done: {n} samples -> {args._mgpu_out}")
+        return
+    if mgpu_indices:
+        _run_multi_gpu_still(mgpu_indices, args.output, args.samples, post_fx, tracer)
+        return
+    tracer.render_to_file(args.output, samples=args.samples, post_fx=post_fx)
+
+
+def _do_video_render(tracer, active_path, args, post_fx, is_worker, mgpu_indices, video_res, video_fps):
+    """Dispatches a video render the same 3 ways as _do_still_render (see
+    above), except a worker's "share" is a CONTIGUOUS block of frame
+    indices (--_mgpu-start/--_mgpu-end) rather than a sample count -- see
+    the module note above _run_multi_gpu_still for why."""
+    if is_worker:
+        frame_subset = range(args._mgpu_start, args._mgpu_end)
+        tracer.render_video(active_path, out_path=args.video_output, resolution=video_res,
+                             post_fx=post_fx, fps=video_fps, camera_sync=args.camera_sync,
+                             frame_subset=frame_subset, skip_encode=True)
+        return
+    if mgpu_indices:
+        _run_multi_gpu_video(mgpu_indices, args.video_output, video_fps, args.camera_sync,
+                              active_path, VIDEO_DURATION)
+        return
+    tracer.render_video(active_path, out_path=args.video_output, resolution=video_res,
+                         post_fx=post_fx, fps=video_fps, camera_sync=args.camera_sync)
+
 
 def main(argv=None):
     args = parse_args(argv)
@@ -4189,6 +4558,14 @@ def main(argv=None):
                          camera_path=camera_path, embed_assets=not args.no_embed_assets)
         return
 
+    is_mgpu_worker = args._mgpu_role is not None
+    mgpu_indices = []
+    if args.headless and not is_mgpu_worker:
+        mgpu_indices = _resolve_multi_gpu_indices(args.multi_gpu)
+    elif (not is_mgpu_worker) and args.multi_gpu not in (None, 'off'):
+        print("--multi-gpu is ignored outside --headless (interactive mode is inherently "
+              "single-process/real-time).")
+
     if args.headless:
         if args.video:
             active_path = sensor_data if sensor_data is not None else camera_path
@@ -4196,16 +4573,13 @@ def main(argv=None):
             if not has_path:
                 print("The scene has no camera keyframes -- nothing to move the camera along, "
                       "rendering a single still image instead.")
-                tracer.set_resolution(*FINAL_RENDER_RES)
-                tracer.render_to_file(args.output, samples=args.samples, post_fx=post_fx)
+                _do_still_render(tracer, args, post_fx, is_mgpu_worker, mgpu_indices)
             else:
                 video_res = _parse_wh(args.video_resolution) if args.video_resolution else VIDEO_RES
-                tracer.render_video(active_path, out_path=args.video_output,
-                                     resolution=video_res, post_fx=post_fx,
-                                     fps=video_fps, camera_sync=args.camera_sync)
+                _do_video_render(tracer, active_path, args, post_fx, is_mgpu_worker, mgpu_indices,
+                                  video_res, video_fps)
         else:
-            tracer.set_resolution(*FINAL_RENDER_RES)
-            tracer.render_to_file(args.output, samples=args.samples, post_fx=post_fx)
+            _do_still_render(tracer, args, post_fx, is_mgpu_worker, mgpu_indices)
         return
 
     # --- Interactive mode -------------------------------------------------
