@@ -242,7 +242,7 @@ WATER_WAVE_SPEED = 1.0          # multiplier applied to the "time" fed into the 
                                  # ripple function when rendering video -- 0 = water stays
                                  # still like before, 1 = default speed, higher = faster
                                  # "running" ripples. Edit directly.
-WATER_ANIMATE_CAUSTICS = False   # whether to recompute the caustic map (the light patterns
+WATER_ANIMATE_CAUSTICS = True   # whether to recompute the caustic map (the light patterns
                                  # under water) in step with the ripples when rendering video
                                  # (recomputing EVERY frame would be very slow, so it's only
                                  # redone every WATER_CAUSTIC_UPDATE_INTERVAL video-seconds)
