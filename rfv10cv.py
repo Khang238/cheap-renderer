@@ -235,7 +235,7 @@ VIDEO_DURATION = 17.0             # seconds -- ONLY used when there is EXACTLY 1
                                   # duration from via speed/distance). With >=2 keyframes,
                                   # duration is COMPUTED from distance + speed per keyframe
                                   # (see CameraPath.total_duration).
-VIDEO_SAMPLES_PER_FRAME = 8       # raytrace samples per video frame
+VIDEO_SAMPLES_PER_FRAME = 16       # raytrace samples per video frame
 
 # --- WATER MOTION IN VIDEO (does not affect stills/live) ---------------
 WATER_WAVE_SPEED = 1.0          # multiplier applied to the "time" fed into the water
@@ -1777,6 +1777,219 @@ class CameraPath:
         # "locked off" camera shouldn't develop footstep jolts just because
         # it's moving fast.
         self.footstep_shake = 1.0
+        # --- Camera "inertia" (momentum/overshoot on direction changes) ---
+        # 0.0 = old behaviour, dead-straight linear interpolation between
+        # keyframes with instantaneous direction changes at each one. > 0
+        # runs the raw linear path through a damped spring (see
+        # _build_inertia_cache) so position/yaw/pitch keep some momentum
+        # instead of snapping onto the new segment's velocity -- a fast
+        # pan left immediately followed by a pan right will overshoot left
+        # a bit and "bounce" back onto the new direction, the way a real
+        # handheld camera (or its operator's arm) can't instantly reverse.
+        # Distinct from handheld_shake (that's noise layered on top of an
+        # otherwise-followed path; this instead changes HOW the path
+        # itself is followed) -- the two stack fine together.
+        self.inertia = 0.0
+        # How springy/bouncy the overshoot is: 0 = critically damped (no
+        # overshoot at all, just a smoothed-out lag), higher = underdamped
+        # (visibly bounces past the target 1+ times before settling).
+        self.inertia_bounce = 0.35
+        self._inertia_cache = None  # see _build_inertia_cache
+
+    def _raw_pose_at(self, t):
+        """Plain linear keyframe interpolation at time t, WITHOUT inertia
+        smoothing or handheld/footstep shake -- returns (pos, yaw, pitch,
+        phase_acc, seg_speed) where phase_acc/seg_speed feed _gait_offset.
+        This is the ground-truth trajectory that _build_inertia_cache
+        resamples and smooths; sample() below adds shake back on top of
+        the (possibly inertia-smoothed) result."""
+        n = len(self.keyframes)
+        if n == 0:
+            return None
+        if n == 1:
+            kf = self.keyframes[0]
+            return kf.pos.copy(), kf.yaw, kf.pitch, 0.0, 0.0
+        durs = self.segment_durations()
+        total = sum(durs)
+        t_clamped = max(0.0, min(t, total))
+        acc = 0.0
+        phase_acc = 0.0
+        for i, d in enumerate(durs):
+            a, b = self.keyframes[i], self.keyframes[i + 1]
+            seg_len = float(np.linalg.norm(b.pos - a.pos))
+            seg_speed = seg_len / d if d > 1e-9 else 0.0
+            seg_stride = _stride_length(seg_speed)
+            last = (i == len(durs) - 1)
+            if t_clamped <= acc + d or last:
+                local_t = (t_clamped - acc) / d if d > 1e-9 else 1.0
+                local_t = max(0.0, min(1.0, local_t))
+                pos = a.pos + (b.pos - a.pos) * local_t
+                yaw = a.yaw + _shortest_angle_diff(a.yaw, b.yaw) * local_t
+                pitch = a.pitch + (b.pitch - a.pitch) * local_t
+                phase_acc += (local_t * seg_len) / seg_stride if seg_stride > 1e-6 else 0.0
+                return pos, float(yaw), float(pitch), phase_acc, seg_speed
+            phase_acc += seg_len / seg_stride if seg_stride > 1e-6 else 0.0
+            acc += d
+        kf = self.keyframes[-1]
+        return kf.pos.copy(), kf.yaw, kf.pitch, phase_acc, 0.0
+
+    def _inertia_signature(self):
+        """Cheap "did anything the cache depends on change" fingerprint --
+        rebuilt lazily in _sample_smoothed only when this changes, so a
+        long interactive session doesn't re-simulate the spring every
+        single call."""
+        return (id(self.keyframes), len(self.keyframes), self.total_duration(),
+                self.inertia, self.inertia_bounce,
+                tuple(round(kf.yaw, 6) for kf in self.keyframes),
+                tuple(round(float(x), 6) for kf in self.keyframes for x in kf.pos))
+
+    def _build_inertia_cache(self):
+        """Pre-computes a smoothed (pos, yaw, pitch) trajectory by running
+        the RAW linear path (see _raw_pose_at) through a damped spring
+        that chases it over time, then samples/caches that spring's
+        output on a dense fixed time grid.
+
+        Why precompute on a grid instead of smoothing live inside
+        sample(): sample() is called with arbitrary, sometimes
+        out-of-order t (render_video's motion blur jitters t backward/
+        forward within each frame's shutter window, and --multi-gpu
+        splits a video into independent per-process time BLOCKS) -- a
+        naive "step the spring forward from the last t seen" approach
+        would make the result depend on call order/history, so different
+        frames (or GPU workers) of the same render could disagree about
+        where the camera was at the same t. Simulating the whole path
+        once, forward in time, up front sidesteps that: every later
+        sample(t) just looks up the same precomputed curve regardless of
+        what was queried before or by whom, so motion-blur sub-samples
+        and multi-GPU blocks all agree, exactly like the un-smoothed path
+        already did.
+
+        The spring is a standard mass-spring-damper (critically-damped-
+        style harmonic oscillator, semi-implicit Euler integration):
+        stiffness comes from self.inertia (higher = takes LONGER to snap
+        back onto the raw path, i.e. more perceived momentum -- so
+        "inertia" here is really a settling-time dial, not literal mass),
+        and self.inertia_bounce sets the damping ratio (low damping = more
+        overshoot/bounce past the raw path before it settles).
+        """
+        n = len(self.keyframes)
+        if n < 2 or self.inertia <= 1e-6:
+            self._inertia_cache = None
+            return
+        total = self.total_duration()
+        if total <= 1e-6:
+            self._inertia_cache = None
+            return
+        # Fixed grid fine enough to resolve fast direction changes (short
+        # segments/holds) without needing an adaptive step -- 240 Hz is
+        # comfortably above any video frame rate and any plausible
+        # keyframe-segment duration used interactively.
+        sim_hz = 240.0
+        sim_dt = 1.0 / sim_hz
+        # A little pre-roll and post-roll so the spring can settle onto
+        # the FIRST keyframe's pose before t=0 (instead of starting the
+        # simulation already "at rest" exactly on the raw path, which
+        # would silently disable inertia for the very first segment) and
+        # keep bouncing a bit past the last keyframe instead of being cut
+        # off mid-overshoot.
+        pre_roll = 1.5
+        post_roll = 1.5
+        t0 = -pre_roll
+        t1 = total + post_roll
+        n_steps = max(2, int(math.ceil((t1 - t0) / sim_dt)) + 1)
+
+        # Spring tuning: inertia in [0, 3] (same range as handheld_shake's
+        # slider) maps to a settling time constant -- higher inertia means
+        # the camera takes LONGER to catch up to the raw path (more
+        # perceived momentum), so stiffness is inversely related to it.
+        # omega_n is the spring's natural frequency (rad/s); zeta is the
+        # damping ratio (0 = undamped/never settles, 1 = critically
+        # damped/no overshoot, >1 = overdamped/sluggish with no overshoot).
+        time_constant = 0.08 + 0.6 * min(self.inertia, 3.0)
+        omega_n = 1.0 / max(1e-3, time_constant)
+        zeta = max(0.05, 1.0 - max(0.0, min(1.0, self.inertia_bounce)) * 0.85)
+
+        raw0 = self._raw_pose_at(max(0.0, t0))
+        pos = raw0[0].astype(np.float64).copy()
+        yaw = float(raw0[1])
+        pitch = float(raw0[2])
+        vel_pos = np.zeros(3, dtype=np.float64)
+        vel_yaw = 0.0
+        vel_pitch = 0.0
+
+        grid_pos = np.empty((n_steps, 3), dtype=np.float32)
+        grid_yaw = np.empty(n_steps, dtype=np.float32)
+        grid_pitch = np.empty(n_steps, dtype=np.float32)
+        grid_phase = np.empty(n_steps, dtype=np.float32)
+        grid_speed = np.empty(n_steps, dtype=np.float32)
+
+        k = omega_n * omega_n
+        c = 2.0 * zeta * omega_n
+        prev_target_yaw = yaw
+        for i in range(n_steps):
+            t = t0 + i * sim_dt
+            t_query = max(0.0, min(total, t))
+            r_pos, r_yaw, r_pitch, phase_acc, seg_speed = self._raw_pose_at(t_query)
+            r_pos = r_pos.astype(np.float64)
+            # Unwrap the raw target's yaw against the PREVIOUS target (not
+            # against the spring's own yaw) so a raw path that itself
+            # wraps through +-pi doesn't confuse the spring into thinking
+            # it needs to swing all the way around.
+            r_yaw = prev_target_yaw + _shortest_angle_diff(prev_target_yaw, r_yaw)
+            prev_target_yaw = r_yaw
+
+            acc_pos = k * (r_pos - pos) - c * vel_pos
+            vel_pos = vel_pos + acc_pos * sim_dt
+            pos = pos + vel_pos * sim_dt
+
+            acc_yaw = k * (r_yaw - yaw) - c * vel_yaw
+            vel_yaw = vel_yaw + acc_yaw * sim_dt
+            yaw = yaw + vel_yaw * sim_dt
+
+            acc_pitch = k * (r_pitch - pitch) - c * vel_pitch
+            vel_pitch = vel_pitch + acc_pitch * sim_dt
+            pitch = pitch + vel_pitch * sim_dt
+
+            grid_pos[i] = pos
+            grid_yaw[i] = yaw
+            grid_pitch[i] = pitch
+            grid_phase[i] = phase_acc
+            grid_speed[i] = seg_speed
+
+        self._inertia_cache = {
+            'sig': self._inertia_signature(),
+            't0': t0, 'dt': sim_dt, 'n': n_steps,
+            'pos': grid_pos, 'yaw': grid_yaw, 'pitch': grid_pitch,
+            'phase': grid_phase, 'speed': grid_speed,
+        }
+
+    def _sample_smoothed(self, t):
+        """Like _raw_pose_at, but with inertia smoothing applied when
+        self.inertia > 0 (rebuilding the cached spring trajectory first
+        if keyframes/inertia settings changed since it was last built).
+        Falls back to _raw_pose_at unchanged when inertia is off, so
+        inertia == 0.0 reproduces the exact old behaviour."""
+        if len(self.keyframes) < 2 or self.inertia <= 1e-6:
+            return self._raw_pose_at(t)
+        if self._inertia_cache is None or self._inertia_cache['sig'] != self._inertia_signature():
+            self._build_inertia_cache()
+        cache = self._inertia_cache
+        if cache is None:
+            return self._raw_pose_at(t)
+        # Look up the smoothed curve at t via linear interpolation between
+        # the two nearest grid samples -- the grid is dense (240 Hz)
+        # relative to anything that queries it, so this is visually
+        # indistinguishable from re-simulating at the exact t.
+        local = (t - cache['t0']) / cache['dt']
+        i0 = max(0, min(cache['n'] - 1, int(math.floor(local))))
+        i1 = min(cache['n'] - 1, i0 + 1)
+        frac = max(0.0, min(1.0, local - i0))
+        pos = cache['pos'][i0] + (cache['pos'][i1] - cache['pos'][i0]) * frac
+        yaw = cache['yaw'][i0] + (cache['yaw'][i1] - cache['yaw'][i0]) * frac
+        pitch = cache['pitch'][i0] + (cache['pitch'][i1] - cache['pitch'][i0]) * frac
+        phase = cache['phase'][i0] + (cache['phase'][i1] - cache['phase'][i0]) * frac
+        speed = cache['speed'][i0] + (cache['speed'][i1] - cache['speed'][i0]) * frac
+        return pos.astype(np.float32), float(yaw), float(pitch), float(phase), float(speed)
 
     def _handheld_offset(self, t):
         """Deterministic (no RNG -- see note below), multi-frequency
@@ -1923,62 +2136,27 @@ class CameraPath:
 
     def sample(self, t):
         """t (seconds from the start of the path) -> (pos np.float32[3], yaw, pitch, roll)
-        LINEARLY interpolated along the path. With only 1 keyframe, always
-        returns that keyframe (camera stays still). Returns None if the path
-        is empty. Handheld sway (_handheld_offset) and, once actually
-        moving, footstep shake (_gait_offset) are both added on top of the
-        plain interpolated pose -- see their docstrings."""
-        n = len(self.keyframes)
-        if n == 0:
+        interpolated along the path -- LINEARLY when self.inertia == 0.0
+        (old behaviour, unchanged), or through a damped-spring "momentum"
+        filter when self.inertia > 0 (see _build_inertia_cache: direction
+        changes then ease/overshoot instead of snapping instantly). With
+        only 1 keyframe, always returns that keyframe (camera stays still
+        -- inertia has nothing to smooth with just one pose). Returns None
+        if the path is empty. Handheld sway (_handheld_offset) and, once
+        actually moving, footstep shake (_gait_offset) are both added on
+        top of the (possibly inertia-smoothed) interpolated pose -- see
+        their docstrings."""
+        if not self.keyframes:
             return None
-        if n == 1:
-            kf = self.keyframes[0]
-            pos_off, yaw_off, pitch_off, roll_off = self._handheld_offset(t)
-            gpos, gyaw, gpitch, groll = self._gait_offset(t, 0.0, 0.0)
-            return (kf.pos.copy() + pos_off + gpos, kf.yaw + yaw_off + gyaw,
-                    kf.pitch + pitch_off + gpitch, roll_off + groll)
-
-        durs = self.segment_durations()
-        total = sum(durs)
-        t_clamped = max(0.0, min(t, total))
-        acc = 0.0
-        # Cumulative fractional STRIDE count, built up segment-by-segment as
-        # we scan for the one containing t_clamped -- each segment's own
-        # (constant, since interpolation within a segment is linear-in-time)
-        # speed determines its own stride length (_stride_length), so gait
-        # tempo changes naturally with how fast a given segment is moving.
-        # A held segment (0 distance/explicit duration -- see hold()) has
-        # speed 0 and contributes nothing, so footsteps correctly pause
-        # during a hold.
-        phase_acc = 0.0
-        for i, d in enumerate(durs):
-            a, b = self.keyframes[i], self.keyframes[i + 1]
-            seg_len = float(np.linalg.norm(b.pos - a.pos))
-            seg_speed = seg_len / d if d > 1e-9 else 0.0
-            seg_stride = _stride_length(seg_speed)
-            last = (i == len(durs) - 1)
-            if t_clamped <= acc + d or last:
-                local_t = (t_clamped - acc) / d if d > 1e-9 else 1.0
-                local_t = max(0.0, min(1.0, local_t))
-                pos = a.pos + (b.pos - a.pos) * local_t
-                yaw = a.yaw + _shortest_angle_diff(a.yaw, b.yaw) * local_t
-                pitch = a.pitch + (b.pitch - a.pitch) * local_t
-                phase_acc += (local_t * seg_len) / seg_stride if seg_stride > 1e-6 else 0.0
-                # Handheld shake is evaluated at the UN-clamped t (not
-                # t_clamped) so it keeps evolving smoothly even if a caller
-                # samples slightly past the path's end -- only matters at
-                # the boundary, keeps the wobble continuous there.
-                pos_off, yaw_off, pitch_off, roll_off = self._handheld_offset(t)
-                gpos, gyaw, gpitch, groll = self._gait_offset(t, seg_speed, phase_acc)
-                return (pos + pos_off + gpos, float(yaw) + yaw_off + gyaw,
-                        float(pitch) + pitch_off + gpitch, roll_off + groll)
-            phase_acc += seg_len / seg_stride if seg_stride > 1e-6 else 0.0
-            acc += d
-        kf = self.keyframes[-1]
+        pos, yaw, pitch, phase_acc, seg_speed = self._sample_smoothed(t)
+        # Handheld shake is evaluated at the UN-clamped t (not any
+        # internally-clamped local time) so it keeps evolving smoothly even
+        # if a caller samples slightly past the path's end -- only matters
+        # at the boundary, keeps the wobble continuous there.
         pos_off, yaw_off, pitch_off, roll_off = self._handheld_offset(t)
-        gpos, gyaw, gpitch, groll = self._gait_offset(t, 0.0, phase_acc)
-        return (kf.pos.copy() + pos_off + gpos, kf.yaw + yaw_off + gyaw,
-                kf.pitch + pitch_off + gpitch, roll_off + groll)
+        gpos, gyaw, gpitch, groll = self._gait_offset(t, seg_speed, phase_acc)
+        return (pos + pos_off + gpos, yaw + yaw_off + gyaw,
+                pitch + pitch_off + gpitch, roll_off + groll)
 
     def to_list(self):
         return [kf.to_dict() for kf in self.keyframes]
@@ -3895,6 +4073,8 @@ def save_scene_file(path, scene: Scene, tracer: RayTracer, post_fx=None,
         'handheld_shake': camera_path.handheld_shake if camera_path is not None else 0.0,
         'handheld_seed': camera_path.handheld_seed if camera_path is not None else 0.0,
         'footstep_shake': camera_path.footstep_shake if camera_path is not None else 1.0,
+        'inertia': camera_path.inertia if camera_path is not None else 0.0,
+        'inertia_bounce': camera_path.inertia_bounce if camera_path is not None else 0.35,
         'scene': scene.to_dict(assets=assets),
     }
     if assets is not None:
@@ -3912,9 +4092,9 @@ def load_scene_file(path):
     exposure, eye_adapt_enabled, eye_adapt_speed, caustics_enabled,
     background (Background), lights (list[Light]), spotlights
     (list[SpotLight]), post_fx (dict), camera_path (CameraPath, with
-    handheld_shake/handheld_seed already applied to it). Any embedded
-    assets are extracted next to the scene file, into
-    '<scene_file_stem>_assets/'."""
+    handheld_shake/handheld_seed/inertia/inertia_bounce already applied
+    to it). Any embedded assets are extracted next to the scene file,
+    into '<scene_file_stem>_assets/'."""
     with open(path, 'r') as f:
         data = json.load(f)
     if data.get('format') != SCENE_FILE_FORMAT:
@@ -3943,6 +4123,8 @@ def load_scene_file(path):
     camera_path.handheld_shake = data.get('handheld_shake', 0.0)
     camera_path.handheld_seed = data.get('handheld_seed', 0.0)
     camera_path.footstep_shake = data.get('footstep_shake', 1.0)
+    camera_path.inertia = data.get('inertia', 0.0)
+    camera_path.inertia_bounce = data.get('inertia_bounce', 0.35)
 
     return {
         'scene': scene, 'camera': data.get('camera', {'pos': [0, 6, -30], 'yaw': 0.0, 'pitch': 0.0}),
@@ -4495,8 +4677,41 @@ def _build_postfx_params(tracer, post_fx, camera_path, has_camera_data):
             lambda v: setattr(camera_path, 'handheld_shake', v), 'float', 0.05, 0.0, 3.0)
         add("  Footstep shake multiplier", lambda: camera_path.footstep_shake,
             lambda v: setattr(camera_path, 'footstep_shake', v), 'float', 0.05, 0.0, 3.0)
+        add("Camera inertia", lambda: camera_path.inertia,
+            lambda v: setattr(camera_path, 'inertia', v), 'float', 0.05, 0.0, 3.0)
+        add("  Bounce (overshoot)", lambda: camera_path.inertia_bounce,
+            lambda v: setattr(camera_path, 'inertia_bounce', v), 'float', 0.05, 0.0, 1.0)
 
     return params
+
+
+def _postfx_row_geometry(params):
+    """Derives tree depth/branch info for each row from the existing
+    label-indentation convention (a label with no leading spaces is an FX
+    "root"; a label starting with 2+ leading spaces is that root's child --
+    see _build_postfx_params, unchanged there) so the menu can draw
+    tree-style branch lines without needing a separate data structure.
+    Returns a list of dicts (same length/order as params), one per row:
+      'depth'   -- 0 for a root/FX row, 1 for a sub-property row.
+      'text'    -- the label with its leading indent stripped (the tree
+                   lines themselves now carry that visual nesting instead).
+      'is_last' -- True if this is the LAST child in its root's group
+                   (its branch connector is an "L" corner instead of a
+                   "T" tee), or True for a childless root.
+    """
+    geom = []
+    n = len(params)
+    for i, p in enumerate(params):
+        label = p['label']
+        stripped = label.lstrip(' ')
+        depth = 1 if (len(label) - len(stripped)) >= 2 else 0
+        is_last = True
+        if depth == 1:
+            nxt = params[i + 1]['label'] if i + 1 < n else ''
+            nxt_depth = 1 if (len(nxt) - len(nxt.lstrip(' '))) >= 2 else 0
+            is_last = (nxt_depth == 0)
+        geom.append({'depth': depth, 'text': stripped, 'is_last': is_last})
+    return geom
 
 
 def postfx_menu_cv(canvas, sw, sh, params):
@@ -4504,11 +4719,39 @@ def postfx_menu_cv(canvas, sw, sh, params):
     adjusts its value (bool rows just flip either way), Enter also flips a
     bool row, Esc closes. Every row edits the actual live tracer/post_fx/
     camera_path object directly (see _build_postfx_params) -- closing this
-    menu doesn't "apply" anything, it already IS applied."""
+    menu doesn't "apply" anything, it already IS applied.
+
+    Layout: root rows (an FX's own on/off/name row) sit at a fixed left
+    margin; sub-property rows are indented further right and connected to
+    their root with tree-style branch lines (a vertical "trunk" running
+    down the group with "|-" tees off of it, an "L" corner on the last
+    child) so a run of properties visually reads as belonging to one FX.
+    Each row's value is right-aligned in its own column, joined to the
+    label by a short dark-gray leader line (like a table of contents)
+    instead of arbitrary whitespace, so values line up regardless of how
+    long each label is.
+    """
     sel = 0
     n = len(params)
-    viewport = 18
-    row_h = 24
+    geom = _postfx_row_geometry(params)
+    header_h = 68
+    footer_h = 14
+    # Row height / viewport size are DERIVED from the actual window height
+    # (sh) instead of a fixed 18 rows / 24px -- that fixed pairing assumed
+    # a taller window than PREVIEW_RES's current 640x360 and got the
+    # bottom rows cut off below the visible canvas. This keeps every row
+    # on-screen (down to a legible minimum row height) no matter the
+    # window size.
+    row_h = max(14, min(24, (sh - header_h - footer_h) // max(1, min(n, 18))))
+    viewport = max(1, (sh - header_h - footer_h) // row_h)
+
+    tree_x = 24        # left edge of the tree-line gutter
+    root_text_x = 42   # root (FX) label text -- one step in from the gutter
+    child_indent = 26  # extra right-shift for a sub-property vs. its root
+    child_text_x = root_text_x + child_indent
+    value_right_x = sw - 28  # right edge that every value is right-aligned against
+    leader_color = (90, 90, 95)  # dark gray leader line, BGR handled by cv2 line below
+
     open_ = True
     while open_ and n > 0:
         canvas[:] = (16, 16, 20)
@@ -4521,9 +4764,35 @@ def postfx_menu_cv(canvas, sw, sh, params):
         _draw_text_shadow(canvas, title, (24, 32))
         _draw_text_shadow(canvas, subtitle, (24, 50), color=(150, 150, 150), scale=_HUD_SCALE_SMALL)
         top = max(0, min(sel - viewport // 2, max(0, n - viewport)))
-        for row, i in enumerate(range(top, min(n, top + viewport))):
+        bottom = min(n, top + viewport)
+
+        # --- Tree trunk lines: one continuous vertical segment per FX
+        # group that has at least one visible child row in [top, bottom),
+        # running from the group's root row down to its last visible
+        # child row. Drawn before the rows/text so text sits on top.
+        i = top
+        while i < bottom:
+            if geom[i]['depth'] == 0:
+                root_row = i - top
+                j = i + 1
+                last_child_row = None
+                while j < bottom and geom[j]['depth'] == 1:
+                    last_child_row = j - top
+                    j += 1
+                if last_child_row is not None:
+                    trunk_x = tree_x + 6
+                    y_top = 68 + root_row * row_h + row_h // 2
+                    y_bot = 68 + last_child_row * row_h + row_h // 2
+                    cv2.line(canvas, (trunk_x, y_top), (trunk_x, y_bot), (80, 80, 88), 1, cv2.LINE_AA)
+                i = j if j > i + 1 else i + 1
+            else:
+                i += 1
+
+        for row, i in enumerate(range(top, bottom)):
             p = params[i]
+            g = geom[i]
             y = 68 + row * row_h
+            y_mid = y - 5  # roughly vertical-center of the text baseline for line-drawing
             val = p['get']()
             if p['kind'] == 'bool':
                 val_s = "ON" if val else "off"
@@ -4531,10 +4800,39 @@ def postfx_menu_cv(canvas, sw, sh, params):
                 val_s = f"{int(val)}"
             else:
                 val_s = f"{val:.3f}"
-            marker = ">" if i == sel else " "
-            line = f"{marker} {p['label']:<30} {val_s}"
-            color = (255, 255, 130) if i == sel else (195, 195, 195)
-            _draw_text_shadow(canvas, line, (24, y), color=color, scale=_HUD_SCALE_SMALL)
+            is_sel = (i == sel)
+            color = (255, 255, 130) if is_sel else (195, 195, 195)
+            marker = ">" if is_sel else " "
+
+            # --- Branch connector + label text ---
+            if g['depth'] == 0:
+                _draw_text_shadow(canvas, marker, (tree_x - 16, y), color=color, scale=_HUD_SCALE_SMALL)
+                text_x = root_text_x
+            else:
+                trunk_x = tree_x + 6
+                corner_x = trunk_x + 14
+                if g['is_last']:
+                    # "L" corner: down-then-right, stops here (last child).
+                    cv2.line(canvas, (trunk_x, y_mid - row_h // 2 + 2), (trunk_x, y_mid), (80, 80, 88), 1, cv2.LINE_AA)
+                    cv2.line(canvas, (trunk_x, y_mid), (corner_x, y_mid), (80, 80, 88), 1, cv2.LINE_AA)
+                else:
+                    # "T" tee: trunk keeps going past this row.
+                    cv2.line(canvas, (trunk_x, y_mid), (corner_x, y_mid), (80, 80, 88), 1, cv2.LINE_AA)
+                if is_sel:
+                    _draw_text_shadow(canvas, marker, (tree_x - 16, y), color=color, scale=_HUD_SCALE_SMALL)
+                text_x = child_text_x
+            _draw_text_shadow(canvas, g['text'], (text_x, y), color=color, scale=_HUD_SCALE_SMALL)
+
+            # --- Leader line + right-aligned value ---
+            label_end_x = text_x + _text_width(g['text'], scale=_HUD_SCALE_SMALL)
+            val_w = _text_width(val_s, scale=_HUD_SCALE_SMALL)
+            val_x = value_right_x - val_w
+            leader_gap = 6
+            leader_x0 = label_end_x + leader_gap
+            leader_x1 = val_x - leader_gap
+            if leader_x1 > leader_x0:
+                cv2.line(canvas, (leader_x0, y_mid), (leader_x1, y_mid), leader_color, 1, cv2.LINE_AA)
+            _draw_text_shadow(canvas, val_s, (val_x, y), color=color, scale=_HUD_SCALE_SMALL)
         cv2.imshow(WINDOW_NAME, canvas)
         raw = cv2.waitKeyEx(30)
         kind, val = classify_key(raw)
@@ -4687,6 +4985,18 @@ def parse_args(argv=None):
                          "specifically (the sharper per-step jolt/nod/lean while actually moving, "
                          "vs. the constant idle sway) -- 1.0 (default) = normal, 0 = idle sway only, "
                          ">1 = exaggerated footsteps. Has no effect if --handheld-shake is 0.")
+    p.add_argument('--inertia', type=float, default=0.0,
+                    help="Adds 'momentum' to camera KEYFRAME paths (P/O -- ignored for "
+                         "--camera-data/--camera-stream): instead of instantly snapping onto each "
+                         "new segment's direction, the camera eases/overshoots through direction "
+                         "changes like a real handheld camera can't instantly reverse. 0 = off "
+                         "(exact old linear interpolation), higher = more momentum/lag. Distinct "
+                         "from --handheld-shake (that's noise on top of the path; this changes how "
+                         "the path itself is followed) -- the two stack fine together.")
+    p.add_argument('--inertia-bounce', type=float, default=None,
+                    help="Damping for --inertia's spring: 0 = critically damped (smooth ease, no "
+                         "overshoot), 1 (default 0.35) = strongly underdamped (visibly bounces past "
+                         "the target before settling). Has no effect if --inertia is 0.")
     p.add_argument('--multi-gpu', type=str, default='off',
                     help="Split a --headless render across multiple NVIDIA GPUs in separate "
                          "processes (Taichi can't span one kernel launch across GPUs -- see the "
@@ -4846,6 +5156,10 @@ def main(argv=None):
         camera_path.handheld_shake = float(args.handheld_shake)
     if args.footstep_shake is not None:
         camera_path.footstep_shake = float(args.footstep_shake)
+    if args.inertia:
+        camera_path.inertia = float(args.inertia)
+    if args.inertia_bounce is not None:
+        camera_path.inertia_bounce = float(args.inertia_bounce)
 
     sensor_data = None
     stream_data = None    # LiveCameraStream (--camera-stream) -- see its docstring
