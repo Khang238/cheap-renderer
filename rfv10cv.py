@@ -204,8 +204,8 @@ def normalize(v):
 #    doesn't need to thread resolution through every function signature).
 # =============================================================================
 
-PREVIEW_RES = (640, 480)         # window size + 2D painter's-algorithm preview
-LIVE_RENDER_RES = (128, 96)      # interactive raytrace resolution (upscaled to window)
+PREVIEW_RES = (640, 360)         # window size + 2D painter's-algorithm preview
+LIVE_RENDER_RES = (96, 54)       # interactive raytrace resolution (upscaled to window)
 FINAL_RENDER_RES = (3840, 2160)  # final image (F5), saved to file
 MAX_W, MAX_H = FINAL_RENDER_RES
 
@@ -242,7 +242,7 @@ WATER_WAVE_SPEED = 1.0          # multiplier applied to the "time" fed into the 
                                  # ripple function when rendering video -- 0 = water stays
                                  # still like before, 1 = default speed, higher = faster
                                  # "running" ripples. Edit directly.
-WATER_ANIMATE_CAUSTICS = True   # whether to recompute the caustic map (the light patterns
+WATER_ANIMATE_CAUSTICS = True    # whether to recompute the caustic map (the light patterns
                                  # under water) in step with the ripples when rendering video
                                  # (recomputing EVERY frame would be very slow, so it's only
                                  # redone every WATER_CAUSTIC_UPDATE_INTERVAL video-seconds)
@@ -3545,18 +3545,52 @@ def draw_light_indicator(canvas, lights, selected_idx, camera_pos, R, half_tan, 
                 cv2.polylines(canvas, [tri], True, (255, 255, 255), 2, cv2.LINE_AA)
 
 
+def draw_orientation_gizmo(canvas, cx, cy, R, radius=28):
+    """Small 3-axis compass (world X=red, Y=green, Z=blue, BGR-adjusted for
+    cv2) showing the camera's current orientation -- drawn as a fixed HUD
+    element (screen-space, not scene-space) near the position/rotation text.
+    Axes are the world unit axes rotated into camera space (R.T, the same
+    convention used everywhere else here for projecting world directions),
+    drawn back-to-front so whichever axis currently points more toward the
+    camera overlaps the others correctly, like a typical 3D-viewport gizmo."""
+    axes = [
+        (np.array([1.0, 0.0, 0.0]), (60, 60, 230), "X"),   # red (BGR)
+        (np.array([0.0, 1.0, 0.0]), (80, 200, 80), "Y"),   # green
+        (np.array([0.0, 0.0, 1.0]), (230, 140, 60), "Z"),  # blue
+    ]
+    cv2.circle(canvas, (cx, cy), radius + 8, (35, 32, 28), -1, cv2.LINE_AA)
+    cv2.circle(canvas, (cx, cy), radius + 8, (95, 85, 75), 1, cv2.LINE_AA)
+    Rt = R.T
+    items = []
+    for axis, color, label in axes:
+        cam = Rt @ axis  # this world axis, expressed in camera space
+        items.append((cam[2], cam, color, label))
+    items.sort(key=lambda it: it[0])  # farthest (most "into the screen") drawn first
+    for _, cam, color, label in items:
+        tip = (cx + int(cam[0] * radius), cy - int(cam[1] * radius))
+        thick = 3 if cam[2] > 0 else 1  # bolder when this axis points toward the viewer
+        cv2.line(canvas, (cx, cy), tip, color, thick, cv2.LINE_AA)
+        cv2.circle(canvas, tip, 4, color, -1, cv2.LINE_AA)
+        cv2.putText(canvas, label, (tip[0] + 5, tip[1] + 4), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.35, color, 1, cv2.LINE_AA)
+
+
 # =============================================================================
 # 14b) Camera path -- draws the camera keyframes + connecting line on the
 #      preview, and finds the camera keyframe "being aimed at" (closest to
 #      the crosshair) so the O key knows which keyframe to edit/delete.
 # =============================================================================
 
-def find_targeted_keyframe(camera_path, camera_pos, R, half_tan, aspect, sw, sh, max_screen_dist=48):
-    """Returns the index of the keyframe CLOSEST to the crosshair (screen
-    center), within max_screen_dist pixels and in front of the camera --
+def find_targeted_keyframe(camera_path, camera_pos, R, half_tan, aspect, sw, sh, max_screen_dist=48,
+                            aim_x=None, aim_y=None):
+    """Returns the index of the keyframe CLOSEST to the aim point (screen
+    center by default, or an explicit (aim_x, aim_y) -- used for mouse-click
+    picking), within max_screen_dist pixels and in front of the camera --
     or None if there is none."""
     best_idx, best_d = None, max_screen_dist
     hw, hh = sw / 2.0, sh / 2.0
+    ax = hw if aim_x is None else aim_x
+    ay = hh if aim_y is None else aim_y
     Rt = R.T
     for i, kf in enumerate(camera_path.keyframes):
         rel = kf.pos - camera_pos
@@ -3565,7 +3599,40 @@ def find_targeted_keyframe(camera_path, camera_pos, R, half_tan, aspect, sw, sh,
             continue
         sx = (xc / (zc * half_tan * aspect)) * hw + hw
         sy = (-yc / (zc * half_tan)) * hh + hh
-        d = math.hypot(sx - hw, sy - hh)
+        d = math.hypot(sx - ax, sy - ay)
+        if d < best_d:
+            best_d, best_idx = d, i
+    return best_idx
+
+
+def find_targeted_light(lights, spotlights, camera_pos, R, half_tan, aspect, sw, sh,
+                         aim_x=None, aim_y=None, max_screen_dist=26):
+    """Returns an index into the COMBINED [lights..., spotlights...] list for
+    whichever light/spotlight marker is closest to the aim point (screen
+    center by default, or an explicit (aim_x, aim_y) for mouse-click
+    picking), within max_screen_dist pixels -- or None. Mirrors the same
+    screen-space projection draw_light_indicator uses (including its
+    off-screen edge-marker fallback for lights behind/beside the camera,
+    so a light's edge arrow is clickable too, not just its on-screen dot)."""
+    best_idx, best_d = None, max_screen_dist
+    hw, hh = sw / 2.0, sh / 2.0
+    ax = hw if aim_x is None else aim_x
+    ay = hh if aim_y is None else aim_y
+    Rt = R.T
+    combined = list(lights) + list(spotlights)
+    for i, lt in enumerate(combined):
+        rel = lt.position - camera_pos
+        xc, yc, zc = Rt @ rel
+        if zc > 0.1:
+            sx = (xc / (zc * half_tan * aspect)) * hw + hw
+            sy = (-yc / (zc * half_tan)) * hh + hh
+        else:
+            mag = math.sqrt(xc * xc + yc * yc) + 1e-9
+            dx, dy = xc / mag, -yc / mag
+            margin = 24
+            sx = hw + dx * (hw - margin)
+            sy = hh + dy * (hh - margin)
+        d = math.hypot(sx - ax, sy - ay)
         if d < best_d:
             best_d, best_idx = d, i
     return best_idx
@@ -4265,6 +4332,275 @@ def keyframe_options_menu_cv(canvas, sw, sh, kf, idx):
 
 
 # =============================================================================
+# 19b) Light properties "menu" -- keyboard-driven, opened by clicking a
+#      light/spotlight marker directly (or Tab-selecting it, then this key).
+#      Same blocking-loop pattern as keyframe_options_menu_cv.
+# =============================================================================
+
+def light_options_menu_cv(canvas, sw, sh, light, idx, camera_pos, camera_rot, camera_roll,
+                           is_spot=False):
+    """Blocking modal menu for editing one light/spotlight's properties in
+    place. Position/color are entered via the terminal (not practical to
+    drag numeric text in a plain cv2 window); brightness and (for
+    spotlights) cone angle/softness have quick +/- keys since those get
+    tweaked far more often. Returns True if anything changed (caller is
+    responsible for tracer.sync_lights()/compute_caustics() afterward,
+    since those are somewhat expensive and shouldn't run on every keypress)."""
+    changed = False
+    choosing = True
+    while choosing:
+        canvas[:] = (18, 20, 22)
+        kind = "Spotlight" if is_spot else "Light"
+        title = f"{kind} #{idx + 1}  --  brightness {light.brightness:.2f}" + (
+            f"  cone {light.cone_angle:.0f} deg  soft {light.softness:.2f}" if is_spot else "")
+        tw = _text_width(title)
+        _draw_text_shadow(canvas, title, (sw // 2 - tw // 2, sh // 2 - 110))
+
+        labels = ["1) Brightness +0.25", "2) Brightness -0.25",
+                  "3) Move to the camera's position" + (" (+aim)" if is_spot else ""),
+                  "4) Set color (terminal, R G B 0-255)",
+                  "5) Set position (terminal, exact X Y Z)"]
+        if is_spot:
+            labels += ["6) Cone angle +3 deg", "7) Cone angle -3 deg",
+                       "8) Softness +0.1", "9) Softness -0.1"]
+        labels.append("0) Close (Esc)")
+
+        for i, label in enumerate(labels):
+            lw = _text_width(label)
+            y = sh // 2 - 60 + i * 26
+            _draw_text_shadow(canvas, label, (sw // 2 - lw // 2, y))
+        cv2.imshow(WINDOW_NAME, canvas)
+        raw = cv2.waitKeyEx(30)
+        if raw == -1:
+            continue
+        ascii_code = raw & 0xFF
+        if ascii_code == 27 or ascii_code == ord('0'):
+            choosing = False
+        elif ascii_code == ord('1'):
+            light.brightness = max(0.0, light.brightness + 0.25); changed = True
+        elif ascii_code == ord('2'):
+            light.brightness = max(0.0, light.brightness - 0.25); changed = True
+        elif ascii_code == ord('3'):
+            light.position = camera_pos.astype(np.float32).copy()
+            if is_spot:
+                light.direction = camera_matrix(*camera_rot, camera_roll)[:, 2].astype(np.float32)
+            changed = True
+        elif ascii_code == ord('4'):
+            try:
+                raw_in = input(f"New color for {kind.lower()} #{idx + 1} "
+                                f"(R G B, each 0-255, currently "
+                                f"{int(light.color[0]*255)} {int(light.color[1]*255)} "
+                                f"{int(light.color[2]*255)}): ").split()
+                r, g, b = (max(0.0, min(255.0, float(x))) for x in raw_in)
+                light.color = np.array([r, g, b], dtype=np.float32) / 255.0
+                changed = True
+            except Exception:
+                print("Invalid color -- left unchanged.")
+        elif ascii_code == ord('5'):
+            try:
+                raw_in = input(f"New position for {kind.lower()} #{idx + 1} "
+                                f"(X Y Z, currently {light.position[0]:.2f} "
+                                f"{light.position[1]:.2f} {light.position[2]:.2f}): ").split()
+                x, y, z = (float(v) for v in raw_in)
+                light.position = np.array([x, y, z], dtype=np.float32)
+                changed = True
+            except Exception:
+                print("Invalid position -- left unchanged.")
+        elif is_spot and ascii_code == ord('6'):
+            light.cone_angle = max(3.0, min(80.0, light.cone_angle + 3.0)); changed = True
+        elif is_spot and ascii_code == ord('7'):
+            light.cone_angle = max(3.0, min(80.0, light.cone_angle - 3.0)); changed = True
+        elif is_spot and ascii_code == ord('8'):
+            light.softness = max(0.0, min(1.0, light.softness + 0.1)); changed = True
+        elif is_spot and ascii_code == ord('9'):
+            light.softness = max(0.0, min(1.0, light.softness - 0.1)); changed = True
+    return changed
+
+
+# =============================================================================
+# 19c) Post-FX / renderer properties menu (` key) -- a live, scrollable
+#      list of (almost) every tunable in DEFAULT_POST_FX plus the handful
+#      of renderer-level dials on RayTracer/CameraPath (exposure, ambient,
+#      sky light, caustic strength, handheld/footstep shake). Reading and
+#      writing go straight through closures into the SAME post_fx dict /
+#      tracer / camera_path the rest of the program already uses -- there's
+#      no separate copy to sync back, so a change here takes effect the
+#      moment you make it (dof_enabled flips on immediately, exposure
+#      changes the very next frame, etc.), same as the old dedicated toggle
+#      keys did, just for every parameter instead of only on/off ones.
+# =============================================================================
+
+def _build_postfx_params(tracer, post_fx, camera_path, has_camera_data):
+    params = []
+
+    def add(label, get, set_, kind, step=0.0, lo=None, hi=None):
+        params.append({'label': label, 'get': get, 'set': set_, 'kind': kind,
+                        'step': step, 'lo': lo, 'hi': hi})
+
+    def pf(key):
+        return lambda: post_fx[key]
+
+    def spf(key):
+        def setter(v):
+            post_fx[key] = v
+        return setter
+
+    add("Exposure", lambda: tracer.exposure, lambda v: setattr(tracer, 'exposure', v),
+        'float', 0.05, 0.02, 20.0)
+    add("[Y] Eye adaptation (auto exposure)", lambda: tracer.eye_adapt_enabled,
+        lambda v: setattr(tracer, 'eye_adapt_enabled', v), 'bool')
+    add("  Eye adapt speed", lambda: tracer.eye_adapt_speed,
+        lambda v: setattr(tracer, 'eye_adapt_speed', v), 'float', 0.1, 0.05, 20.0)
+    add("Ambient light", lambda: tracer.ambient, lambda v: setattr(tracer, 'ambient', v),
+        'float', 0.02, 0.0, 2.0)
+    add("Sky light strength", lambda: tracer.sky_light_strength,
+        lambda v: setattr(tracer, 'sky_light_strength', v), 'float', 0.05, 0.0, 5.0)
+    add("[C] Caustics enabled", lambda: tracer.caustics_enabled,
+        lambda v: setattr(tracer, 'caustics_enabled', v), 'bool')
+    add("  Caustic strength", lambda: tracer.caustic_strength,
+        lambda v: setattr(tracer, 'caustic_strength', v), 'float', 0.1, 0.0, 5.0)
+
+    add("[U] Depth of field", pf('dof_enabled'), spf('dof_enabled'), 'bool')
+    add("  [-/=] Focus distance", pf('dof_focus_distance'), spf('dof_focus_distance'), 'float', 0.5, 0.1, 2000.0)
+    add("  Blur strength", pf('dof_blur_strength'), spf('dof_blur_strength'), 'float', 0.05, 0.0, 5.0)
+    add("  Max blur radius (px)", pf('dof_max_radius'), spf('dof_max_radius'), 'int', 2, 0, 200)
+    add("[G] Continuous autofocus (video)", pf('autofocus_enabled'), spf('autofocus_enabled'), 'bool')
+    add("  Autofocus speed", pf('autofocus_speed'), spf('autofocus_speed'), 'float', 0.2, 0.05, 20.0)
+
+    add("[R] Chromatic aberration", pf('chroma_enabled'), spf('chroma_enabled'), 'bool')
+    add("  Strength", pf('chroma_strength'), spf('chroma_strength'), 'float', 0.001, 0.0, 0.05)
+
+    add("[N] Lens flare", pf('flare_enabled'), spf('flare_enabled'), 'bool')
+    add("  Size", pf('flare_size'), spf('flare_size'), 'float', 2.0, 0.0, 300.0)
+    add("  Intensity", pf('flare_intensity'), spf('flare_intensity'), 'float', 0.05, 0.0, 5.0)
+    add("  Anamorphic streak", pf('flare_anamorphic'), spf('flare_anamorphic'), 'float', 0.02, 0.0, 1.0)
+    add("  Halo", pf('flare_halo'), spf('flare_halo'), 'float', 0.02, 0.0, 1.0)
+
+    add("[F] Fisheye lens", pf('fisheye_enabled'), spf('fisheye_enabled'), 'bool')
+    add("  Strength", pf('fisheye_strength'), spf('fisheye_strength'), 'float', 0.02, 0.0, 1.0)
+
+    add("[B] Bloom", pf('bloom_enabled'), spf('bloom_enabled'), 'bool')
+    add("  Threshold", pf('bloom_threshold'), spf('bloom_threshold'), 'float', 0.02, 0.0, 1.0)
+    add("  Intensity", pf('bloom_intensity'), spf('bloom_intensity'), 'float', 0.02, 0.0, 3.0)
+    add("  Radius (px)", pf('bloom_radius'), spf('bloom_radius'), 'int', 1, 1, 100)
+
+    add("[V] VHS effect", pf('vhs_enabled'), spf('vhs_enabled'), 'bool')
+    add("  Strength", pf('vhs_strength'), spf('vhs_strength'), 'float', 0.05, 0.0, 3.0)
+
+    add("[M] Motion blur (video only)", pf('motion_blur_enabled'), spf('motion_blur_enabled'), 'bool')
+    add("  Shutter", pf('motion_blur_shutter'), spf('motion_blur_shutter'), 'float', 0.05, 0.0, 1.0)
+
+    if not has_camera_data:
+        add("Handheld camera shake", lambda: camera_path.handheld_shake,
+            lambda v: setattr(camera_path, 'handheld_shake', v), 'float', 0.05, 0.0, 3.0)
+        add("  Footstep shake multiplier", lambda: camera_path.footstep_shake,
+            lambda v: setattr(camera_path, 'footstep_shake', v), 'float', 0.05, 0.0, 3.0)
+
+    return params
+
+
+def postfx_menu_cv(canvas, sw, sh, params):
+    """Blocking modal menu (` key): Up/Down selects a row, Left/Right
+    adjusts its value (bool rows just flip either way), Enter also flips a
+    bool row, Esc closes. Every row edits the actual live tracer/post_fx/
+    camera_path object directly (see _build_postfx_params) -- closing this
+    menu doesn't "apply" anything, it already IS applied."""
+    sel = 0
+    n = len(params)
+    viewport = 18
+    row_h = 24
+    open_ = True
+    while open_ and n > 0:
+        canvas[:] = (16, 16, 20)
+        title = "Post-FX / renderer properties  --  Up/Down select, Left/Right adjust, Esc close"
+        subtitle = ("[key] before a row = its own hotkey outside this menu, e.g. [Y] toggles "
+                    "the same eye-adaptation flag as pressing Y. A few other hotkeys don't have "
+                    "a matching row here: [T] focuses instantly (one-shot, not a persistent "
+                    "setting), [H] cycles handheld shake and [2] types in an exact camera "
+                    "position/angle (both are on CameraPath, not post-fx).")
+        _draw_text_shadow(canvas, title, (24, 32))
+        _draw_text_shadow(canvas, subtitle, (24, 50), color=(150, 150, 150), scale=_HUD_SCALE_SMALL)
+        top = max(0, min(sel - viewport // 2, max(0, n - viewport)))
+        for row, i in enumerate(range(top, min(n, top + viewport))):
+            p = params[i]
+            y = 68 + row * row_h
+            val = p['get']()
+            if p['kind'] == 'bool':
+                val_s = "ON" if val else "off"
+            elif p['kind'] == 'int':
+                val_s = f"{int(val)}"
+            else:
+                val_s = f"{val:.3f}"
+            marker = ">" if i == sel else " "
+            line = f"{marker} {p['label']:<30} {val_s}"
+            color = (255, 255, 130) if i == sel else (195, 195, 195)
+            _draw_text_shadow(canvas, line, (24, y), color=color, scale=_HUD_SCALE_SMALL)
+        cv2.imshow(WINDOW_NAME, canvas)
+        raw = cv2.waitKeyEx(30)
+        kind, val = classify_key(raw)
+        if kind == 'arrow':
+            if val == 'up':
+                sel = (sel - 1) % n
+            elif val == 'down':
+                sel = (sel + 1) % n
+            elif val in ('left', 'right'):
+                p = params[sel]
+                if p['kind'] == 'bool':
+                    p['set'](not p['get']())
+                else:
+                    step = p['step'] if val == 'right' else -p['step']
+                    newv = p['get']() + step
+                    if p['lo'] is not None:
+                        newv = max(p['lo'], newv)
+                    if p['hi'] is not None:
+                        newv = min(p['hi'], newv)
+                    if p['kind'] == 'int':
+                        newv = int(round(newv))
+                    p['set'](newv)
+        elif kind == 'char':
+            if val == 'enter':
+                p = params[sel]
+                if p['kind'] == 'bool':
+                    p['set'](not p['get']())
+            elif val == 'esc':
+                open_ = False
+
+
+# =============================================================================
+# 19d) Manual camera position/angle entry (the '2' key) -- terminal prompt,
+#      same pattern as the other "type an exact value" prompts (keyframe
+#      speed, light color/position) rather than an in-canvas text field,
+#      since cv2 has no text-input widget to build on.
+# =============================================================================
+
+def prompt_manual_camera(camera_pos, camera_rot, camera_roll):
+    """Blank input on either line leaves that value unchanged. Returns
+    (new_pos [np.float64 array], new_yaw, new_pitch, new_roll) -- all in
+    radians for the angles, matching camera_rot/camera_roll's own units."""
+    print(f"Current position: {camera_pos[0]:.3f} {camera_pos[1]:.3f} {camera_pos[2]:.3f}")
+    print(f"Current yaw/pitch/roll (degrees): {math.degrees(camera_rot[0]):.1f} "
+          f"{math.degrees(camera_rot[1]):.1f} {math.degrees(camera_roll):.1f}")
+    pos = camera_pos.copy()
+    yaw, pitch, roll = camera_rot[0], camera_rot[1], camera_roll
+    try:
+        raw_in = input("New position (X Y Z, Enter to keep current): ").strip()
+        if raw_in:
+            x, y, z = (float(v) for v in raw_in.split())
+            pos = np.array([x, y, z], dtype=np.float64)
+    except Exception:
+        print("Invalid position -- left unchanged.")
+    try:
+        raw_in = input("New yaw/pitch/roll in DEGREES (Enter to keep current): ").strip()
+        if raw_in:
+            yd, pd, rd = (float(v) for v in raw_in.split())
+            yaw, pitch, roll = math.radians(yd), math.radians(pd), math.radians(rd)
+            pitch = max(-1.5, min(1.5, pitch))
+    except Exception:
+        print("Invalid rotation -- left unchanged.")
+    return pos, yaw, pitch, roll
+
+
+# =============================================================================
 # 20) Command-line interface
 # =============================================================================
 
@@ -4587,16 +4923,61 @@ def main(argv=None):
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
     canvas = np.zeros((WIN_H, WIN_W, 3), dtype=np.uint8)
 
+    # --- Mouse: left-press-and-DRAG to look around; a left-press that stays
+    # within a few pixels of where it started (no real drag) is a CLICK
+    # instead, used to select/edit whatever light or keyframe marker is
+    # under the cursor. Both live on the left button and are disambiguated
+    # by movement distance -- NOT by a separate button -- because the right
+    # button is unusable for this: on most OpenCV backends (GTK in
+    # particular) a right-click first pops up a built-in context menu,
+    # which swallows the button-down event before this callback ever sees a
+    # clean down/up pair, and can leave OpenCV's own mouse state stuck
+    # thinking the button is still held (the "camera keeps following the
+    # mouse until I restart the script" symptom). Left-click has no such
+    # built-in menu, so drag-detection via cv2's per-move `flags` bitmask
+    # (EVENT_FLAG_LBUTTON) is reliable instead of tracking down/up state by
+    # hand. A plain dict (not a class) so the callback closure below can
+    # mutate it without a `nonlocal` per field -- cv2's callback only gets
+    # (event, x, y, flags, userdata), so this dict IS userdata.
+    _MOUSE_CLICK_SLOP = 4  # px -- movement within this radius still counts as a click, not a drag
+    mouse_state = {'down': False, 'down_x': 0, 'down_y': 0, 'last_x': 0, 'last_y': 0,
+                   'accum_dx': 0, 'accum_dy': 0, 'moved_far': False, 'click': None}
+
+    def _mouse_callback(event, x, y, flags, ms):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            ms['down'] = True
+            ms['down_x'], ms['down_y'] = x, y
+            ms['last_x'], ms['last_y'] = x, y
+            ms['moved_far'] = False
+        elif event == cv2.EVENT_MOUSEMOVE and ms['down'] and (flags & cv2.EVENT_FLAG_LBUTTON):
+            if not ms['moved_far'] and math.hypot(x - ms['down_x'], y - ms['down_y']) > _MOUSE_CLICK_SLOP:
+                ms['moved_far'] = True
+            if ms['moved_far']:
+                ms['accum_dx'] += x - ms['last_x']
+                ms['accum_dy'] += y - ms['last_y']
+            ms['last_x'], ms['last_y'] = x, y
+        elif event == cv2.EVENT_LBUTTONUP:
+            if ms['down'] and not ms['moved_far']:
+                ms['click'] = (x, y)
+            ms['down'] = False
+            ms['moved_far'] = False
+
+    cv2.setMouseCallback(WINDOW_NAME, _mouse_callback, mouse_state)
+    mouse_sens = 0.0028  # radians per pixel of drag -- similar feel to look_speed's key-repeat rate
+
     camera_pos = tracer.camera_pos.astype(np.float64)
     camera_rot = tracer.camera_rot.astype(np.float64)
     camera_roll = float(tracer.camera_roll)  # radians -- 0 unless --camera-data supplied one at t=0
     roll_speed = 0.015   # radians per "held" tick (,/. keys) -- matches look_speed
     move_speed = 0.6
-    look_speed = 0.015   # radians per "held" tick (arrow keys) -- replaces mouse_sens
+    look_speed = 0.015   # radians per "held" tick (arrow keys) -- also used as a base for mouse-drag
     lines_mode = True
     live_render = False
     selected_light = 0          # index into the COMBINED list [lights..., spotlights...]
     autofocus_flash = 0.0        # countdown (seconds) for the focus-ring flash effect
+
+    fps_smooth = 0.0
+    last_frame_time = time.time()
 
     replaying = False           # replaying the camera path/sensor data (I key), not rendering
     replay_start_time = 0.0
@@ -4620,15 +5001,18 @@ def main(argv=None):
     preview_geo = precompute_preview_geometry(scene)
     inp = InputState()
 
-    print("Controls: WASD move | arrow keys look | Q/E move down/up | L toggle live raytrace")
+    print("Controls: WASD move | arrow keys OR left-drag mouse to look | Q/E move down/up | "
+          "L toggle live raytrace")
     print("Tab: cycle selected light/spotlight | K: place selected light/spot at the camera (+direction)")
+    print("Left-click a light/spotlight or keyframe marker to open its properties menu directly")
     print("[ / ]: narrow / widen a spotlight's cone (when a spotlight is selected)")
-    print("F: autofocus DoF on whatever is under the crosshair | - / =: nudge DoF focus distance")
+    print("T: autofocus DoF on whatever is under the crosshair | - / =: nudge DoF focus distance")
     print("1: toggle wireframe outline | C: toggle caustics")
-    print("2 DoF | 3 chromatic aberration | 4 lens flare | 6 VHS effect | 7 motion blur (video only)")
-    print("0: fisheye lens | B: bloom | Y: eye adaptation/auto exposure | G: continuous autofocus (video only)")
+    print("U: DoF | R: chromatic aberration | N: lens flare | V: VHS | M: motion blur (video only)")
+    print("F: fisheye lens | B: bloom | Y: eye adaptation/auto exposure | G: continuous autofocus (video only)")
     print("H: cycle handheld camera shake (keyframe paths only)")
-    print("5: render final image | 8: quick render (lower quality)")
+    print("2: type in an exact camera position/angle | `: open the post-FX/renderer properties menu")
+    print("9: render final image | 8: quick render (lower quality) | 0: render video")
     print(", / . : roll camera left/right | / : reset roll to 0")
     if is_live_stream:
         print(f"Live camera stream active on {stream_data.host}:{stream_data.port} -- camera "
@@ -4640,7 +5024,7 @@ def main(argv=None):
     else:
         print("P: add a camera keyframe here | J: add a HOLD keyframe (stay put, can still turn) | "
               "O: edit/delete the targeted keyframe (nearest to crosshair)")
-    print("I: replay the camera path (no render) | 9: render VIDEO along the path")
+    print("I: replay the camera path (no render)")
     print("X: export the current scene/camera/lights/etc to a .json file | Esc: quit")
 
     running = True
@@ -4650,6 +5034,12 @@ def main(argv=None):
         any_input = False
 
         if replaying:
+            # Not consuming drag-look while replaying (movement is
+            # driven by the path itself here) -- but still DRAIN it, or it'd
+            # jump the view the instant replay ends and this starts being
+            # read again.
+            mouse_state['accum_dx'] = 0
+            mouse_state['accum_dy'] = 0
             if is_live_stream:
                 # A live stream never "ends" -- keep following the freshest
                 # pose every frame until the user presses I again to stop.
@@ -4696,6 +5086,16 @@ def main(argv=None):
             if keys.is_held('arrow_right'): d_yaw += look_speed; any_input = True
             if keys.is_held('arrow_up'):    d_pitch -= look_speed; any_input = True
             if keys.is_held('arrow_down'):  d_pitch += look_speed; any_input = True
+            # Left-drag mouselook -- same yaw/pitch sign convention as the
+            # arrow keys above (dx>0 = mouse moved right = turn right =
+            # yaw increases; dy>0 = mouse moved down = look down = pitch
+            # increases), so it feels consistent whichever you use.
+            if mouse_state['accum_dx'] or mouse_state['accum_dy']:
+                d_yaw += mouse_state['accum_dx'] * mouse_sens
+                d_pitch += mouse_state['accum_dy'] * mouse_sens
+                mouse_state['accum_dx'] = 0
+                mouse_state['accum_dy'] = 0
+                any_input = True
             if d_yaw or d_pitch:
                 camera_rot[0] += d_yaw
                 camera_rot[1] += d_pitch
@@ -4713,6 +5113,43 @@ def main(argv=None):
         n_all_lights = n_pt_lights + len(tracer.spotlights)
         targeted_kf_idx = find_targeted_keyframe(camera_path, camera_pos, R, tracer.half_tan,
                                                   tracer.aspect, WIN_W, WIN_H)
+
+        def _open_keyframe_menu(kf_idx):
+            kf = camera_path.keyframes[kf_idx]
+            action, value = keyframe_options_menu_cv(canvas, WIN_W, WIN_H, kf, kf_idx)
+            if action == 'speed_delta':
+                kf.speed = max(0.01, kf.speed + value)
+            elif action == 'set_speed':
+                kf.speed = value
+            elif action == 'delete':
+                camera_path.remove(kf_idx)
+                print(f"Keyframe #{kf_idx + 1} deleted.")
+
+        # --- Mouse click: select + open a properties menu for whatever
+        # light/spotlight or keyframe marker is under the cursor (lights take
+        # priority when both are close, since they're usually the smaller/
+        # more precise target). Equivalent to Tab-selecting + K, or aiming +
+        # O, just without needing the crosshair centered on it first.
+        if mouse_state['click'] is not None:
+            mx, my = mouse_state['click']
+            mouse_state['click'] = None
+            hit_light = find_targeted_light(tracer.lights, tracer.spotlights, camera_pos, R,
+                                             tracer.half_tan, tracer.aspect, WIN_W, WIN_H,
+                                             aim_x=mx, aim_y=my)
+            if hit_light is not None:
+                selected_light = hit_light
+                is_spot = hit_light >= n_pt_lights
+                lt = (tracer.spotlights[hit_light - n_pt_lights] if is_spot
+                      else tracer.lights[hit_light])
+                if light_options_menu_cv(canvas, WIN_W, WIN_H, lt, hit_light, camera_pos,
+                                          camera_rot, camera_roll, is_spot=is_spot):
+                    tracer.sync_lights()
+                    tracer.compute_caustics()
+            elif not has_camera_data:
+                hit_kf = find_targeted_keyframe(camera_path, camera_pos, R, tracer.half_tan,
+                                                 tracer.aspect, WIN_W, WIN_H, aim_x=mx, aim_y=my)
+                if hit_kf is not None:
+                    _open_keyframe_menu(hit_kf)
 
         raw = cv2.waitKeyEx(1)
         if args.print_keys and raw != -1:
@@ -4768,7 +5205,7 @@ def main(argv=None):
                     tracer.sync_lights(); tracer.compute_caustics()
             elif ch == '/' and inp.one_shot('roll_reset', debounce=0.1):
                 camera_roll = 0.0
-            elif ch == 'f' and inp.one_shot('autofocus'):
+            elif ch == 't' and inp.one_shot('autofocus'):
                 Rf = camera_matrix(*camera_rot, camera_roll)
                 fwd = Rf[:, 2]
                 probe_depth(float(camera_pos[0]), float(camera_pos[1]), float(camera_pos[2]),
@@ -4783,22 +5220,22 @@ def main(argv=None):
             elif ch == '=' and inp.one_shot('dof_far', debounce=0.06):
                 if post_fx['dof_enabled']:
                     post_fx['dof_focus_distance'] = max(0.5, post_fx['dof_focus_distance'] + 1.0)
-            elif ch == '2' and inp.one_shot('dof_toggle'):
+            elif ch == 'u' and inp.one_shot('dof_toggle'):
                 post_fx['dof_enabled'] = not post_fx['dof_enabled']
                 print(f"DoF: {post_fx['dof_enabled']}")
-            elif ch == '3' and inp.one_shot('chroma_toggle'):
+            elif ch == 'r' and inp.one_shot('chroma_toggle'):
                 post_fx['chroma_enabled'] = not post_fx['chroma_enabled']
                 print(f"Chromatic aberration: {post_fx['chroma_enabled']}")
-            elif ch == '4' and inp.one_shot('flare_toggle'):
+            elif ch == 'n' and inp.one_shot('flare_toggle'):
                 post_fx['flare_enabled'] = not post_fx['flare_enabled']
                 print(f"Flare: {post_fx['flare_enabled']}")
-            elif ch == '6' and inp.one_shot('vhs_toggle'):
+            elif ch == 'v' and inp.one_shot('vhs_toggle'):
                 post_fx['vhs_enabled'] = not post_fx['vhs_enabled']
                 print(f"VHS: {post_fx['vhs_enabled']}")
-            elif ch == '7' and inp.one_shot('mblur_toggle'):
+            elif ch == 'm' and inp.one_shot('mblur_toggle'):
                 post_fx['motion_blur_enabled'] = not post_fx['motion_blur_enabled']
                 print(f"Motion blur (video only): {post_fx['motion_blur_enabled']}")
-            elif ch == '0' and inp.one_shot('fisheye_toggle'):
+            elif ch == 'f' and inp.one_shot('fisheye_toggle'):
                 post_fx['fisheye_enabled'] = not post_fx['fisheye_enabled']
                 print(f"Fisheye: {post_fx['fisheye_enabled']}")
             elif ch == 'b' and inp.one_shot('bloom_toggle'):
@@ -4819,6 +5256,15 @@ def main(argv=None):
                     nxt = levels[(levels.index(cur) + 1) % len(levels)] if cur in levels else levels[1]
                     camera_path.handheld_shake = nxt
                     print(f"Handheld camera shake: {nxt:.2f}")
+            elif ch == '2' and inp.one_shot('manual_camera', debounce=0.3):
+                new_pos, new_yaw, new_pitch, new_roll = prompt_manual_camera(
+                    camera_pos, camera_rot, camera_roll)
+                camera_pos[:] = new_pos
+                camera_rot[0], camera_rot[1] = new_yaw, new_pitch
+                camera_roll = new_roll
+            elif ch == '`' and inp.one_shot('postfx_menu', debounce=0.3):
+                params = _build_postfx_params(tracer, post_fx, camera_path, has_camera_data)
+                postfx_menu_cv(canvas, WIN_W, WIN_H, params)
             elif ch == 'p' and inp.one_shot('add_keyframe'):
                 if has_camera_data:
                     print("Camera keyframes are disabled while --camera-data is active.")
@@ -4845,15 +5291,7 @@ def main(argv=None):
                 if has_camera_data:
                     print("Camera keyframes are disabled while --camera-data is active.")
                 elif targeted_kf_idx is not None:
-                    kf = camera_path.keyframes[targeted_kf_idx]
-                    action, value = keyframe_options_menu_cv(canvas, WIN_W, WIN_H, kf, targeted_kf_idx)
-                    if action == 'speed_delta':
-                        kf.speed = max(0.01, kf.speed + value)
-                    elif action == 'set_speed':
-                        kf.speed = value
-                    elif action == 'delete':
-                        camera_path.remove(targeted_kf_idx)
-                        print(f"Keyframe #{targeted_kf_idx + 1} deleted.")
+                    _open_keyframe_menu(targeted_kf_idx)
             elif ch == 'i' and inp.one_shot('replay'):
                 if replaying:
                     replaying = False
@@ -4869,7 +5307,7 @@ def main(argv=None):
                     print("Replaying camera path...")
                 else:
                     print("No camera keyframes to replay -- press P to add one first.")
-            elif ch == '9' and inp.one_shot('render_video', debounce=1.0):
+            elif ch == '0' and inp.one_shot('render_video', debounce=1.0):
                 if is_live_stream:
                     print("Live camera stream has no fixed length -- can't render a video from it "
                           "(record it to a --camera-data file first, or use camera keyframes).")
@@ -4883,7 +5321,7 @@ def main(argv=None):
                     tracer.set_resolution(*LIVE_RENDER_RES)
                 else:
                     print("No camera keyframes -- press P to add at least one before rendering a video.")
-            elif ch == '5' and inp.one_shot('final_render', debounce=1.0):
+            elif ch == '9' and inp.one_shot('final_render', debounce=1.0):
                 was_live = live_render
                 live_render = False
                 tracer.set_resolution(*FINAL_RENDER_RES)
@@ -4923,6 +5361,13 @@ def main(argv=None):
         if autofocus_flash > 0.0:
             autofocus_flash = max(0.0, autofocus_flash - 1.0 / 60.0)
 
+        now_t = time.time()
+        frame_dt = now_t - last_frame_time
+        last_frame_time = now_t
+        if frame_dt > 0.0:
+            inst_fps = 1.0 / frame_dt
+            fps_smooth = inst_fps if fps_smooth <= 0.0 else fps_smooth * 0.9 + inst_fps * 0.1
+
         # --- Draw the frame ---
         if live_render:
             tracer.camera_pos = camera_pos.astype(np.float32)
@@ -4940,6 +5385,9 @@ def main(argv=None):
                           tracer.half_tan, tracer.aspect, WIN_W, WIN_H)
         draw_camera_viewfinder(canvas, WIN_W, WIN_H, WIN_W // 2, WIN_H // 2,
                                 focused=(autofocus_flash > 0.0))
+        # Small orientation compass, placed just under the pos/yaw-pitch-roll
+        # text (2 lines) in the top-left corner.
+        draw_orientation_gizmo(canvas, 12 + 45, 12 + 2 * _HUD_LINE_H + 45, R, radius=28)
 
         sel_kind = "spotlight" if selected_light >= n_pt_lights else "light"
         sel_num = (selected_light - n_pt_lights + 1) if selected_light >= n_pt_lights else (selected_light + 1)
@@ -4950,7 +5398,7 @@ def main(argv=None):
         ]
         tr_lines = [
             f"live raytrace: {'ON' if live_render else 'off'}",
-            f"caustics: {'on' if tracer.caustics_enabled else 'off'}",
+            f"FPS: {fps_smooth:.0f}",
         ]
         if has_camera_data:
             cam_line = f"camera data: {_camera_data_count_str()}" + (" (following)" if is_live_stream and replaying else " (replaying)" if replaying else "")
@@ -4964,7 +5412,8 @@ def main(argv=None):
             f"DoF {'on' if post_fx['dof_enabled'] else 'off'}"
             + (f" @ {post_fx['dof_focus_distance']:.1f}" if post_fx['dof_enabled'] else "")
             + (" (AF)" if post_fx.get('autofocus_enabled', False) else ""),
-            f"VHS {'on' if post_fx['vhs_enabled'] else 'off'}  flare {'on' if post_fx['flare_enabled'] else 'off'}",
+            f"VHS {'on' if post_fx['vhs_enabled'] else 'off'}  flare {'on' if post_fx['flare_enabled'] else 'off'}  "
+            f"caustics {'on' if tracer.caustics_enabled else 'off'}",
             f"fisheye {'on' if post_fx.get('fisheye_enabled', False) else 'off'}  "
             f"bloom {'on' if post_fx.get('bloom_enabled', False) else 'off'}  "
             f"exposure {tracer.exposure:.2f}{'(auto)' if tracer.eye_adapt_enabled else ''}",
