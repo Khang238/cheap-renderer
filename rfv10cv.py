@@ -56,11 +56,13 @@ import base64
 import json
 import math
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 import cv2
@@ -2820,8 +2822,14 @@ class RayTracer:
         contiguous blocks (not interleaved frames) are used and what that
         costs (eye-adaptation/autofocus lag start "cold" at each block's
         first frame, same as they would at the very start of a normal render).
-        skip_encode: if True, don't run ffmpeg at the end (the --multi-gpu
-        orchestrator does that once, after ALL workers/blocks are done)."""
+        skip_encode: if True, this call is one --multi-gpu worker's block --
+        out_path is that worker's own segment file (already a complete,
+        independently playable video on its own), and the --multi-gpu
+        orchestrator joins every worker's segment into the final file
+        afterward (see _run_multi_gpu_video). Doesn't change how frames are
+        written -- every render_video call streams straight to ffmpeg via
+        VideoStreamWriter regardless of skip_encode; it only changes what
+        out_path refers to and the log message at the end."""
         is_sensor = camera_path.is_camera_data()
         n_kf = 0 if is_sensor else len(camera_path.keyframes)
         if not is_sensor and n_kf == 0:
@@ -2830,9 +2838,15 @@ class RayTracer:
 
         n_frames, frame_times, total_time, camera_sync = _compute_video_frame_plan(
             camera_path, fps, duration, camera_sync)
-        frames_dir = os.path.splitext(out_path)[0] + "_frames"
-        os.makedirs(frames_dir, exist_ok=True)
         frame_range = range(n_frames) if frame_subset is None else list(frame_subset)
+        # Frames are streamed straight into an ffmpeg subprocess as they're
+        # produced (see VideoStreamWriter) instead of being saved as
+        # individual PNGs and stitched afterward -- this removes the
+        # per-frame PIL/PNG-compression step that was pegging the CPU and
+        # stalling the GPU between frames. `out_path` is either the final
+        # video (single-process render) or this worker's own segment file
+        # (when frame_subset/skip_encode indicate a --multi-gpu block).
+        writer = VideoStreamWriter(out_path, resolution[0], resolution[1], fps)
 
         post_fx = post_fx if post_fx is not None else dict(DEFAULT_POST_FX)
         motion_blur = (not camera_sync) and (n_kf > 1 or is_sensor) and bool(post_fx.get('motion_blur_enabled', False))
@@ -2872,72 +2886,87 @@ class RayTracer:
         # smear -- None on this worker's very first rendered frame (no prior
         # pose to diff against yet, so that frame gets no smear).
         prev_rot_roll = None
-        for ri, fi in enumerate(frame_range):
-            t_center = frame_times[fi] if camera_sync else min((fi + 0.5) * dt, total_time)
-            self.reset_accumulation()
+        try:
+            for ri, fi in enumerate(frame_range):
+                t_center = frame_times[fi] if camera_sync else min((fi + 0.5) * dt, total_time)
+                self.reset_accumulation()
 
-            if animate_caustics:
-                wt = t_center * WATER_WAVE_SPEED
-                if last_caustic_t is None or (wt - last_caustic_t) >= WATER_CAUSTIC_UPDATE_INTERVAL:
-                    WATER_TIME[None] = wt
-                    self.compute_caustics()
-                    last_caustic_t = wt
+                if animate_caustics:
+                    wt = t_center * WATER_WAVE_SPEED
+                    if last_caustic_t is None or (wt - last_caustic_t) >= WATER_CAUSTIC_UPDATE_INTERVAL:
+                        WATER_TIME[None] = wt
+                        self.compute_caustics()
+                        last_caustic_t = wt
 
-            if motion_blur and shutter > 0.0:
-                half = shutter * dt * 0.5
-                t_lo = max(0.0, t_center - half)
-                t_hi = min(total_time, t_center + half)
-                for s in range(samples_per_frame):
-                    frac = (s + np.random.random()) / samples_per_frame
-                    tt = t_lo + (t_hi - t_lo) * frac
-                    pos, yaw, pitch, roll = camera_path.sample(tt)
+                if motion_blur and shutter > 0.0:
+                    half = shutter * dt * 0.5
+                    t_lo = max(0.0, t_center - half)
+                    t_hi = min(total_time, t_center + half)
+                    for s in range(samples_per_frame):
+                        frac = (s + np.random.random()) / samples_per_frame
+                        tt = t_lo + (t_hi - t_lo) * frac
+                        pos, yaw, pitch, roll = camera_path.sample(tt)
+                        self.camera_pos = pos.astype(np.float32)
+                        self.camera_rot = np.array([yaw, pitch], dtype=np.float32)
+                        self.camera_roll = roll
+                        self.water_time = tt * WATER_WAVE_SPEED
+                        self.add_samples(1)
+                else:
+                    pos, yaw, pitch, roll = camera_path.sample(t_center)
                     self.camera_pos = pos.astype(np.float32)
                     self.camera_rot = np.array([yaw, pitch], dtype=np.float32)
                     self.camera_roll = roll
-                    self.water_time = tt * WATER_WAVE_SPEED
-                    self.add_samples(1)
-            else:
-                pos, yaw, pitch, roll = camera_path.sample(t_center)
-                self.camera_pos = pos.astype(np.float32)
-                self.camera_rot = np.array([yaw, pitch], dtype=np.float32)
-                self.camera_roll = roll
-                self.water_time = t_center * WATER_WAVE_SPEED
-                self.add_samples(samples_per_frame)
+                    self.water_time = t_center * WATER_WAVE_SPEED
+                    self.add_samples(samples_per_frame)
 
-            if do_eye_adapt:
-                target_exposure = self.measure_target_exposure()
-                self.exposure += (target_exposure - self.exposure) * adapt_k
+                if do_eye_adapt:
+                    target_exposure = self.measure_target_exposure()
+                    self.exposure += (target_exposure - self.exposure) * adapt_k
 
-            if do_autofocus:
-                R_af = camera_matrix(*self.camera_rot, self.camera_roll)
-                forward = R_af[:, 2]
-                probe_depth(float(self.camera_pos[0]), float(self.camera_pos[1]), float(self.camera_pos[2]),
-                            float(forward[0]), float(forward[1]), float(forward[2]))
-                target_focus = float(np.clip(PROBE_DEPTH[None], 0.3, 2000.0))
-                current_focus += (target_focus - current_focus) * af_k
-                post_fx['dof_focus_distance'] = current_focus
+                if do_autofocus:
+                    R_af = camera_matrix(*self.camera_rot, self.camera_roll)
+                    forward = R_af[:, 2]
+                    probe_depth(float(self.camera_pos[0]), float(self.camera_pos[1]), float(self.camera_pos[2]),
+                                float(forward[0]), float(forward[1]), float(forward[2]))
+                    target_focus = float(np.clip(PROBE_DEPTH[None], 0.3, 2000.0))
+                    current_focus += (target_focus - current_focus) * af_k
+                    post_fx['dof_focus_distance'] = current_focus
 
-            color, depth = self.current_image_float()
-            curr_rot_roll = (float(self.camera_rot[0]), float(self.camera_rot[1]), float(self.camera_roll))
-            if post_fx.get('enabled', True):
-                R = camera_matrix(*self.camera_rot, self.camera_roll)
-                flares = compute_flare_list(self, self.camera_pos, R)
-                camera_pose = (self.camera_pos, R, self.half_tan, self.aspect)
-                motion_px = _camera_motion_px(prev_rot_roll, curr_rot_roll,
-                                               self.width, self.height, self.half_tan, self.aspect)
-                color = apply_post_processing(color, depth, flares, post_fx, frame_seed=fi,
-                                               camera_pose=camera_pose, motion_px=motion_px)
-            prev_rot_roll = curr_rot_roll
-            img = (np.clip(color, 0.0, 1.0) * 255).astype(np.uint8)
-            Image.fromarray(img).save(os.path.join(frames_dir, f"frame_{fi:05d}.png"))
+                color, depth = self.current_image_float()
+                curr_rot_roll = (float(self.camera_rot[0]), float(self.camera_rot[1]), float(self.camera_roll))
+                if post_fx.get('enabled', True):
+                    R = camera_matrix(*self.camera_rot, self.camera_roll)
+                    flares = compute_flare_list(self, self.camera_pos, R)
+                    camera_pose = (self.camera_pos, R, self.half_tan, self.aspect)
+                    motion_px = _camera_motion_px(prev_rot_roll, curr_rot_roll,
+                                                   self.width, self.height, self.half_tan, self.aspect)
+                    color = apply_post_processing(color, depth, flares, post_fx, frame_seed=fi,
+                                                   camera_pose=camera_pose, motion_px=motion_px)
+                prev_rot_roll = curr_rot_roll
+                img = (np.clip(color, 0.0, 1.0) * 255).astype(np.uint8)
+                # Handed straight to the ffmpeg pipe -- no PNG file, no PIL
+                # encode step. submit() returns immediately (the actual
+                # write/encode happens on VideoStreamWriter's background
+                # thread), so the GPU can start the NEXT frame right away.
+                writer.submit(img)
 
-            elapsed = time.time() - t0
-            frac_done = (ri + 1) / n_render
-            eta = (elapsed / frac_done - elapsed) if frac_done > 0 else 0.0
-            print(f"\r  Frame {fi + 1}/{n_frames}  {frac_done * 100:5.1f}%  "
-                  f"elapsed {elapsed:6.1f}s  ETA {eta:6.1f}s", end="", flush=True)
-            if progress_cb is not None:
-                progress_cb(ri + 1, n_render, elapsed, eta)
+                elapsed = time.time() - t0
+                frac_done = (ri + 1) / n_render
+                eta = (elapsed / frac_done - elapsed) if frac_done > 0 else 0.0
+                print(f"\r  Frame {fi + 1}/{n_frames}  {frac_done * 100:5.1f}%  "
+                      f"elapsed {elapsed:6.1f}s  ETA {eta:6.1f}s", end="", flush=True)
+                if progress_cb is not None:
+                    progress_cb(ri + 1, n_render, elapsed, eta)
+        except Exception:
+            # Something went wrong mid-render -- shut the ffmpeg subprocess
+            # down (ignoring any error from an already-broken pipe) rather
+            # than leaving it hanging around waiting for more frames that
+            # will never arrive, then let the original exception propagate.
+            try:
+                writer.close()
+            except Exception:
+                pass
+            raise
 
         self.eye_adapt_enabled = do_eye_adapt
         self.set_resolution(prev_w, prev_h)
@@ -2946,20 +2975,11 @@ class RayTracer:
         WATER_TIME[None] = 0.0
         if animate_caustics:
             self.compute_caustics()  # restore the still (t=0) caustic map, as before rendering video
-        print(f"\nRendered {n_render} frame(s) into: {frames_dir}")
 
-        if skip_encode:
-            # The --multi-gpu orchestrator handles encoding once, after ALL
-            # workers/blocks are done writing into frames_dir.
-            return frames_dir
-        if _encode_video_ffmpeg(frames_dir, out_path, fps):
-            print(f"Encoded video (ffmpeg): {out_path}")
-            return out_path
-        print(f"ffmpeg not found in PATH -- PNG frames are still in "
-              f"'{frames_dir}'. You can encode them yourself with:\n"
-              f"  ffmpeg -framerate {fps} -i {frames_dir}/frame_%05d.png "
-              f"-c:v libx264 -pix_fmt yuv420p {out_path}")
-        return frames_dir
+        writer.close()
+        label = "segment" if skip_encode else "video"
+        print(f"\nEncoded {n_render} frame(s) directly to {label}: {out_path}")
+        return out_path
 
     # --- Serialization of the "shot" (camera + look/render params) --------
     def camera_dict(self):
@@ -2967,24 +2987,127 @@ class RayTracer:
                 'yaw': float(self.camera_rot[0]), 'pitch': float(self.camera_rot[1])}
 
 
-def _encode_video_ffmpeg(frames_dir, out_path, fps):
-    """Stitches a sequence of PNG frames (frame_%05d.png) in frames_dir into a
-    video with ffmpeg (subprocess). Returns True on success, False if ffmpeg
-    isn't found in PATH or ffmpeg fails -- either way the PNG frames are KEPT
-    (not deleted) so the user can handle it themselves."""
+class VideoStreamWriter:
+    """Streams finished RGB frames straight into a persistent ffmpeg
+    subprocess, which encodes them to out_path AS THEY ARRIVE -- no
+    per-frame PNG (or any other) image file is ever written to disk.
+
+    Why: saving each frame as a PNG (PIL's Image.fromarray(...).save(...))
+    then running ffmpeg over the whole directory afterward does two full
+    CPU-bound encode passes (PNG per frame, then H.264 once at the end) in
+    a single thread that also has to synchronously wait on the GPU/BVH
+    raytrace for that frame. On a machine with fast GPU(s) but few CPU
+    cores (e.g. a Kaggle dual-GPU instance), that PNG-encode step is
+    exactly what pins the CPU at/near 100% per worker while the GPU(s)
+    idle waiting for it to finish before the next frame can start.
+
+    This class removes BOTH problems at once:
+      - no PNG encode at all -- raw RGB bytes go straight into ffmpeg's
+        rawvideo input, so the only per-frame CPU cost on the caller's
+        side is a numpy copy plus a queue.put(), and the H.264 encode
+        happens exactly once, incrementally, instead of as a separate
+        pass over saved files;
+      - a background thread owns the actual pipe write, so submit()
+        returns almost immediately and the caller (the raytrace loop) can
+        start the NEXT frame's GPU work while ffmpeg is still busy
+        encoding the previous one on the CPU, instead of the two
+        serializing on each other every single frame.
+
+    Memory footprint: the queue only ever holds a handful of frames
+    in-flight (queue_size), not the whole video -- at 640x480 that's a few
+    MB, not the ~0.9 GB that 1000 buffered raw frames would take. There's
+    no need to stage frames in GPU VRAM either; the raytracer already
+    copies each finished frame out to host RAM (to_numpy) before this
+    class ever sees it, so VRAM was never actually where the time was
+    going."""
+
+    def __init__(self, out_path, width, height, fps, queue_size=4,
+                 crf=18, preset='medium'):
+        if shutil.which('ffmpeg') is None:
+            raise RuntimeError(
+                "ffmpeg not found in PATH -- required to stream-encode video "
+                "(there's no PNG-frames fallback anymore; install ffmpeg "
+                "and re-run).")
+        cmd = [
+            'ffmpeg', '-y', '-loglevel', 'error',
+            '-f', 'rawvideo', '-pix_fmt', 'rgb24',
+            '-s', f'{width}x{height}', '-r', str(fps), '-i', '-',
+            '-an', '-c:v', 'libx264', '-preset', preset, '-crf', str(crf),
+            '-pix_fmt', 'yuv420p', out_path,
+        ]
+        self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        self._queue = queue.Queue(maxsize=queue_size)
+        self._error = None
+        self._thread = threading.Thread(target=self._pump, daemon=True)
+        self._thread.start()
+
+    def _pump(self):
+        """Runs on the background thread: pulls frames off the queue and
+        writes their raw bytes to ffmpeg's stdin, one at a time, until it
+        sees the None sentinel close() sends."""
+        try:
+            while True:
+                frame = self._queue.get()
+                if frame is None:
+                    break
+                self._proc.stdin.write(frame.tobytes())
+        except Exception as e:
+            self._error = e
+
+    def submit(self, frame_rgb_uint8):
+        """Hands off one HxWx3 uint8 RGB frame (same channel order PIL's
+        Image.fromarray expects) to the background writer thread. Returns
+        as soon as there's room in the queue -- it does NOT wait for the
+        frame to actually be written/encoded."""
+        if self._error is not None:
+            raise RuntimeError(f"Video encoder failed: {self._error}")
+        self._queue.put(np.ascontiguousarray(frame_rgb_uint8))
+
+    def close(self):
+        """Signals no more frames are coming, waits for the background
+        thread to drain the queue and finish writing, then waits for
+        ffmpeg itself to finish encoding and checks its exit code."""
+        self._queue.put(None)
+        self._thread.join()
+        try:
+            self._proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        _, stderr = self._proc.communicate()
+        if self._error is not None:
+            raise RuntimeError(f"Video encoder failed: {self._error}")
+        if self._proc.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg exited with code {self._proc.returncode}: "
+                f"{stderr.decode(errors='replace')}")
+
+
+def _concat_video_segments(segment_paths, out_path):
+    """Losslessly joins already-encoded MP4 segments (one per --multi-gpu
+    worker's contiguous frame block, each already a complete, independently
+    playable H.264 file written by that worker's own VideoStreamWriter)
+    into a single final file, using ffmpeg's concat demuxer with `-c copy`
+    (stream copy -- no re-encode, no quality loss, negligible CPU/time).
+    Returns True on success, False if ffmpeg isn't found in PATH."""
     if shutil.which('ffmpeg') is None:
         return False
-    cmd = [
-        'ffmpeg', '-y', '-framerate', str(fps),
-        '-i', os.path.join(frames_dir, 'frame_%05d.png'),
-        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', out_path,
-    ]
+    list_path = out_path + ".concat_list.txt"
+    with open(list_path, "w") as f:
+        for p in segment_paths:
+            f.write(f"file '{os.path.abspath(p)}'\n")
+    cmd = ['ffmpeg', '-y', '-loglevel', 'error', '-f', 'concat', '-safe', '0',
+           '-i', list_path, '-c', 'copy', out_path]
     try:
         subprocess.run(cmd, check=True, capture_output=True)
         return True
     except Exception as e:
-        print(f"\nError running ffmpeg: {e}")
+        print(f"\nError concatenating video segments: {e}")
         return False
+    finally:
+        try:
+            os.remove(list_path)
+        except OSError:
+            pass
 
 
 # =============================================================================
@@ -3135,9 +3258,14 @@ def _run_multi_gpu_still(gpu_indices, out_path, samples, post_fx, tracer):
 def _run_multi_gpu_video(gpu_indices, out_path, fps, camera_sync, active_path, duration):
     """Orchestrates a video render across gpu_indices: splits the frame
     range into one CONTIGUOUS block per GPU (see the module note above for
-    why contiguous rather than interleaved), waits for every worker to
-    finish writing its block's frame_%05d.png files into the shared frames
-    directory, then encodes the video ONCE, here."""
+    why contiguous rather than interleaved). Each worker now streams its
+    own block straight to its own complete, independently-playable MP4
+    segment (via VideoStreamWriter -- no PNG files, no shared frames
+    directory), so once every worker is done there's nothing left to
+    "encode" here, just N finished segments to join in order. That join
+    uses ffmpeg's concat demuxer with `-c copy` (_concat_video_segments),
+    which is a stream copy -- no re-encode, so it costs almost no CPU/time
+    regardless of how many frames were rendered."""
     n_frames, _frame_times, _total_time, _cs = _compute_video_frame_plan(
         active_path, fps, duration, camera_sync)
     n = len(gpu_indices)
@@ -3148,27 +3276,34 @@ def _run_multi_gpu_video(gpu_indices, out_path, fps, camera_sync, active_path, d
         count = base + (1 if i < extra else 0)
         bounds.append((start, start + count))
         start += count
-    frames_dir = os.path.splitext(out_path)[0] + "_frames"
-    os.makedirs(frames_dir, exist_ok=True)
+    tmp_dir = tempfile.mkdtemp(prefix="rfv10cv_mgpu_video_")
     print(f"Multi-GPU video render across {n} GPU(s) {gpu_indices}: "
           f"{n_frames} frames split into contiguous blocks {bounds}")
     procs = []
-    for i, (gpu_idx, (s, e)) in enumerate(zip(gpu_indices, bounds)):
-        if e <= s:
-            continue
-        extra_args = ['--_mgpu-role', 'video', '--_mgpu-start', str(s), '--_mgpu-end', str(e)]
-        seed = (os.getpid() * 7919 + gpu_idx * 104729 + i * 1000003) & 0x7fffffff
-        procs.append(_spawn_mgpu_worker(extra_args, gpu_idx, seed))
-    _wait_mgpu_workers(procs)
+    segment_paths = []
+    try:
+        for i, (gpu_idx, (s, e)) in enumerate(zip(gpu_indices, bounds)):
+            if e <= s:
+                continue
+            seg_path = os.path.join(tmp_dir, f"segment_{i:03d}.mp4")
+            segment_paths.append(seg_path)
+            extra_args = ['--_mgpu-role', 'video', '--_mgpu-start', str(s), '--_mgpu-end', str(e),
+                          '--_mgpu-out', seg_path]
+            seed = (os.getpid() * 7919 + gpu_idx * 104729 + i * 1000003) & 0x7fffffff
+            procs.append(_spawn_mgpu_worker(extra_args, gpu_idx, seed))
+        _wait_mgpu_workers(procs)
 
-    print(f"All {n} GPU(s) finished -- {n_frames} frames in: {frames_dir}")
-    if _encode_video_ffmpeg(frames_dir, out_path, fps):
-        print(f"Encoded video (ffmpeg): {out_path}")
-    else:
-        print(f"ffmpeg not found in PATH -- PNG frames are still in "
-              f"'{frames_dir}'. You can encode them yourself with:\n"
-              f"  ffmpeg -framerate {fps} -i {frames_dir}/frame_%05d.png "
-              f"-c:v libx264 -pix_fmt yuv420p {out_path}")
+        print(f"All {n} GPU(s) finished -- {n_frames} frames encoded across "
+              f"{len(segment_paths)} segment(s), joining ...")
+        if _concat_video_segments(segment_paths, out_path):
+            print(f"Encoded video (streamed per-GPU + concatenated): {out_path}")
+        else:
+            raise RuntimeError(
+                "ffmpeg not found in PATH -- can't join the per-GPU video "
+                "segments into the final file. Install ffmpeg and re-run "
+                "(each worker's own segment render already succeeded).")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 class ProgressiveRenderer:
@@ -5528,7 +5663,7 @@ def _do_video_render(tracer, active_path, args, post_fx, is_worker, mgpu_indices
     the module note above _run_multi_gpu_still for why."""
     if is_worker:
         frame_subset = range(args._mgpu_start, args._mgpu_end)
-        tracer.render_video(active_path, out_path=args.video_output, resolution=video_res,
+        tracer.render_video(active_path, out_path=args._mgpu_out, resolution=video_res,
                              post_fx=post_fx, fps=video_fps, camera_sync=args.camera_sync,
                              frame_subset=frame_subset, skip_encode=True)
         return
