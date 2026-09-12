@@ -1732,10 +1732,20 @@ class CameraKeyframe:
 
 
 def _kick(x):
-    """Sharp single-lobe "impact" shape used for footstep jolts: fast rise,
-    fast decay, peak of 1.0 at x=1/12, ~0 by x=0.5. x is expected in [0, 1)
-    (progress through one footfall's cycle)."""
-    return 32.6 * x * math.exp(-12.0 * x) if 0.0 <= x < 1.0 else 0.0
+    """Footstep "impact" shape: a sharp single-lobe jolt (fast rise, fast
+    decay, peak of 1.0 at x=1/12, ~0 by x=0.5) plus a light damped-
+    oscillation tail after it -- a real body's mass keeps gently
+    rebounding for a moment after each footfall instead of the motion
+    stopping dead the instant the sharp impact decays, which is what made
+    the un-tailed version read as a metronome click rather than a step.
+    Both terms are ~0 at x=0 and x->1, so consecutive footfalls (x wraps
+    back to 0 every cycle) still join up continuously. x is expected in
+    [0, 1) (progress through one footfall's cycle)."""
+    if not (0.0 <= x < 1.0):
+        return 0.0
+    primary = 32.6 * x * math.exp(-12.0 * x)
+    tail = 0.12 * math.sin(x * 18.0) * math.exp(-6.0 * x)
+    return primary + tail
 
 
 def _smoothstep(edge0, edge1, x):
@@ -1926,10 +1936,16 @@ class CameraPath:
         k = omega_n * omega_n
         c = 2.0 * zeta * omega_n
         prev_target_yaw = yaw
+        # Footstep phase/speed are re-derived from the SPRING's own smoothed
+        # velocity here (see below), not the raw path's declared per-segment
+        # speed -- see the note on grid_phase/grid_speed just after the loop
+        # for why: without this, footstep shake pops in intensity/timing at
+        # every keyframe boundary even though the position itself is smooth.
+        smoothed_phase = 0.0
         for i in range(n_steps):
             t = t0 + i * sim_dt
             t_query = max(0.0, min(total, t))
-            r_pos, r_yaw, r_pitch, phase_acc, seg_speed = self._raw_pose_at(t_query)
+            r_pos, r_yaw, r_pitch, _raw_phase, _raw_speed = self._raw_pose_at(t_query)
             r_pos = r_pos.astype(np.float64)
             # Unwrap the raw target's yaw against the PREVIOUS target (not
             # against the spring's own yaw) so a raw path that itself
@@ -1950,16 +1966,35 @@ class CameraPath:
             vel_pitch = vel_pitch + acc_pitch * sim_dt
             pitch = pitch + vel_pitch * sim_dt
 
+            # Speed actually being displayed right now (the spring's own
+            # velocity), not the target segment's nominal speed -- these
+            # differ noticeably right after a keyframe boundary (or any
+            # abrupt speed change) while the spring is still catching up,
+            # which is exactly the moment footstep shake used to pop.
+            smoothed_speed = float(np.linalg.norm(vel_pos))
+            stride = _stride_length(smoothed_speed)
+            if stride > 1e-6:
+                smoothed_phase += (smoothed_speed * sim_dt) / stride
+
             grid_pos[i] = pos
             grid_yaw[i] = yaw
             grid_pitch[i] = pitch
-            grid_phase[i] = phase_acc
-            grid_speed[i] = seg_speed
+            grid_phase[i] = smoothed_phase
+            grid_speed[i] = smoothed_speed
 
         self._inertia_cache = {
             'sig': self._inertia_signature(),
             't0': t0, 'dt': sim_dt, 'n': n_steps,
             'pos': grid_pos, 'yaw': grid_yaw, 'pitch': grid_pitch,
+            # NOTE: unlike pos/yaw/pitch, `phase`/`speed` here are derived
+            # from the SPRING's smoothed velocity (see the loop above), not
+            # a resample of _raw_pose_at's declared per-segment speed --
+            # _gait_offset uses these to decide how hard/fast to shake, so
+            # feeding it the actual on-screen motion (instead of a value
+            # that can jump the instant a new segment starts) keeps the
+            # footstep shake's timing and intensity continuous through
+            # keyframe transitions, matching what inertia already did for
+            # position/yaw/pitch.
             'phase': grid_phase, 'speed': grid_speed,
         }
 
@@ -2624,19 +2659,45 @@ class RayTracer:
 
     def measure_target_exposure(self, target_luma=0.2):
         """Reads back the raw (pre-tonemap) accumulation buffer and returns
-        the exposure multiplier that would put its average luminance at
-        `target_luma` -- the same "aim for 18% gray" logic a real camera's
-        auto-exposure metering uses. Cheap enough to call every frame at
-        the resolutions this renderer targets (a single numpy readback +
-        mean). Used two ways (see eye_adapt_enabled / DEFAULT_POST_FX):
-        INSTANTLY for stills/live-preview (metering should just be correct
-        immediately for a photo), and SMOOTHED frame-to-frame in
-        render_video (a real eye/camera visibly takes a moment to adjust
-        when the scene brightness changes)."""
+        the exposure multiplier that would put the scene's metered
+        luminance at `target_luma` -- the same "aim for 18% gray" logic a
+        real camera's auto-exposure metering uses. Cheap enough to call
+        every frame at the resolutions this renderer targets (a single
+        numpy readback + a couple of reductions). Used two ways (see
+        eye_adapt_enabled / DEFAULT_POST_FX): INSTANTLY for stills/live-
+        preview (metering should just be correct immediately for a photo),
+        and SMOOTHED frame-to-frame in render_video (a real eye/camera
+        visibly takes a moment to adjust when the scene brightness
+        changes).
+
+        The metering itself is a CENTER-WEIGHTED LOG-AVERAGE, not a flat
+        arithmetic mean of every pixel -- a plain mean is what made outdoor
+        shots come out dark: a bright sky filling the top third of frame
+        drags the arithmetic average way up, so the exposure that makes
+        THAT average hit 18% gray ends up crushing the actual foreground/
+        ground into shadow. Real camera meters don't do a flat mean either,
+        for the same reason:
+          - log-average (geometric mean of luminance) is the standard fix
+            used by both camera metering and HDR tonemapping's "key value"
+            calculation -- it's dominated by the bulk of mid-brightness
+            pixels instead of getting dragged around by a relatively small
+            number of very bright ones (sky, sun, hot highlights).
+          - center-weighting biases the reading toward the middle of frame
+            (where the subject usually is) and away from the edges/top,
+            further reducing how much a bright sky band can skew things."""
         n = max(1, int(SAMPLE_COUNT[None]))
         raw = ACCUM.to_numpy()[:self.height, :self.width]
-        luma = raw[..., 0] * 0.2126 + raw[..., 1] * 0.7152 + raw[..., 2] * 0.0722
-        avg = float(luma.mean()) / n
+        luma = (raw[..., 0] * 0.2126 + raw[..., 1] * 0.7152 + raw[..., 2] * 0.0722) / n
+        h, w = luma.shape
+        if h < 2 or w < 2:
+            avg = float(luma.mean())
+        else:
+            yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+            cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+            d = np.sqrt(((xx - cx) / (w / 2.0)) ** 2 + ((yy - cy) / (h / 2.0)) ** 2)
+            weight = 1.0 - 0.65 * np.clip(d, 0.0, 1.0)  # center-weighted, like a real meter
+            log_luma = np.log(np.maximum(luma, 1e-4))
+            avg = float(math.exp(np.average(log_luma, weights=weight)))
         if avg < 1e-5:
             return self.exposure
         return float(np.clip(target_luma / avg, 0.05, 20.0))
@@ -2692,7 +2753,8 @@ class RayTracer:
         if post_fx and post_fx.get('enabled', True):
             R = camera_matrix(*self.camera_rot, self.camera_roll)
             flares = compute_flare_list(self, self.camera_pos, R)
-            color = apply_post_processing(color, depth, flares, post_fx)
+            camera_pose = (self.camera_pos, R, self.half_tan, self.aspect)
+            color = apply_post_processing(color, depth, flares, post_fx, camera_pose=camera_pose)
         img = (np.clip(color, 0.0, 1.0) * 255).astype(np.uint8)
         Image.fromarray(img).save(out_path)
 
@@ -2806,6 +2868,10 @@ class RayTracer:
         print(f"Rendering video {resolution[0]}x{resolution[1]}, {n_frames} frames "
               f"({total_time:.2f}s @ {fps}fps), {samples_per_frame} sample(s)/frame{sync_note}{subset_note} ...")
         t0 = time.time()
+        # Previous frame's (yaw, pitch, roll), for apply_analog_camera's motion
+        # smear -- None on this worker's very first rendered frame (no prior
+        # pose to diff against yet, so that frame gets no smear).
+        prev_rot_roll = None
         for ri, fi in enumerate(frame_range):
             t_center = frame_times[fi] if camera_sync else min((fi + 0.5) * dt, total_time)
             self.reset_accumulation()
@@ -2852,10 +2918,16 @@ class RayTracer:
                 post_fx['dof_focus_distance'] = current_focus
 
             color, depth = self.current_image_float()
+            curr_rot_roll = (float(self.camera_rot[0]), float(self.camera_rot[1]), float(self.camera_roll))
             if post_fx.get('enabled', True):
                 R = camera_matrix(*self.camera_rot, self.camera_roll)
                 flares = compute_flare_list(self, self.camera_pos, R)
-                color = apply_post_processing(color, depth, flares, post_fx, frame_seed=fi)
+                camera_pose = (self.camera_pos, R, self.half_tan, self.aspect)
+                motion_px = _camera_motion_px(prev_rot_roll, curr_rot_roll,
+                                               self.width, self.height, self.half_tan, self.aspect)
+                color = apply_post_processing(color, depth, flares, post_fx, frame_seed=fi,
+                                               camera_pose=camera_pose, motion_px=motion_px)
+            prev_rot_roll = curr_rot_roll
             img = (np.clip(color, 0.0, 1.0) * 255).astype(np.uint8)
             Image.fromarray(img).save(os.path.join(frames_dir, f"frame_{fi:05d}.png"))
 
@@ -3112,6 +3184,7 @@ class ProgressiveRenderer:
         self.active = False
         self.post_fx = post_fx if post_fx is not None else dict(DEFAULT_POST_FX)
         self._frame_seed = 0
+        self._prev_rot_roll = None  # see apply_analog_camera's motion smear
 
     def start(self):
         self.tracer.reset_accumulation()
@@ -3128,7 +3201,15 @@ class ProgressiveRenderer:
         R = camera_matrix(*self.tracer.camera_rot, self.tracer.camera_roll)
         flares = compute_flare_list(self.tracer, self.tracer.camera_pos, R)
         self._frame_seed += 1
-        color = apply_post_processing(color, depth, flares, self.post_fx, frame_seed=self._frame_seed)
+        camera_pose = (self.tracer.camera_pos, R, self.tracer.half_tan, self.tracer.aspect)
+        curr_rot_roll = (float(self.tracer.camera_rot[0]), float(self.tracer.camera_rot[1]),
+                          float(self.tracer.camera_roll))
+        motion_px = _camera_motion_px(self._prev_rot_roll, curr_rot_roll,
+                                       self.tracer.width, self.tracer.height,
+                                       self.tracer.half_tan, self.tracer.aspect)
+        self._prev_rot_roll = curr_rot_roll
+        color = apply_post_processing(color, depth, flares, self.post_fx, frame_seed=self._frame_seed,
+                                       camera_pose=camera_pose, motion_px=motion_px)
 
         img_rgb = (np.clip(color, 0.0, 1.0) * 255).astype(np.uint8)
         img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
@@ -3139,16 +3220,17 @@ class ProgressiveRenderer:
 
 # =============================================================================
 # 13) Post-processing (CPU / numpy) -- lens flare, DoF, chromatic aberration,
-#     VHS. All parameters default in DEFAULT_POST_FX, editable directly in
-#     code or at runtime via the post_fx dict.
+#     fog, god rays, bloom, VHS, analog-camera film look. All parameters
+#     default in DEFAULT_POST_FX, editable directly in code or at runtime
+#     via the post_fx dict.
 # =============================================================================
 
 DEFAULT_POST_FX = {
     'enabled': True,
     'dof_enabled': False,
     'dof_focus_distance': 25.0,   # focus point (world units) -- adjustable via keys when enabled
-    'dof_blur_strength': 0.5,     # how "sensitive" the blur is to focus-distance error
-    'dof_max_radius': 48,          # max blur radius (px, at the resolution being rendered)
+    'dof_blur_strength': 0.2,     # how "sensitive" the blur is to focus-distance error
+    'dof_max_radius': 16,          # max blur radius (px, at the resolution being rendered)
     'autofocus_enabled': False,   # video only -- see render_video's autofocus block. Photo/live
                                    # preview focus is always instant (the F key probes depth and
                                    # sets dof_focus_distance directly); this flag instead makes
@@ -3159,22 +3241,63 @@ DEFAULT_POST_FX = {
     'chroma_enabled': True,
     'chroma_strength': 0.004,     # how far the R/B channels shift from center (fraction of screen)
     'flare_enabled': True,
-    'flare_size': 55.0,           # main glow radius (px, referenced at 360p)
-    'flare_intensity': 0.9,       # additive flare intensity
-    'flare_anamorphic': 0.18,     # horizontal anamorphic streak strength (0 = disabled)
-    'flare_halo': 0.3,            # secondary ring/halo strength (0 = disabled)
+    'flare_size': 20.0,           # main glow radius (px, referenced at 360p)
+    'flare_intensity': 0.28,       # additive flare intensity
+    'flare_anamorphic': 0.52,     # horizontal anamorphic streak strength (0 = disabled)
+    'flare_halo': 0.62,            # secondary ring/halo strength (0 = disabled)
     'fisheye_enabled': False,     # wide-angle lens barrel distortion
     'fisheye_strength': 0.32,     # 0 = rectilinear (no distortion), ~0.2-0.5 = visible bulge
-    'bloom_enabled': True,        # highlight glow/bleed -- extracted from bright areas post-tonemap
-    'bloom_threshold': 0.62,      # 0..1 -- brightness above which a pixel starts contributing to bloom
-    'bloom_intensity': 0.45,      # additive bloom strength
+    'bloom_enabled': False,        # highlight glow/bleed -- extracted from bright areas post-tonemap
+    'bloom_threshold': 0.72,      # 0..1 -- brightness above which a pixel starts contributing to bloom
+    'bloom_intensity': 0.25,      # additive bloom strength (screen-blended -- see apply_bloom)
     'bloom_radius': 22,           # glow spread (px, referenced at 360p)
-    'vhs_enabled': True,         # VHS tape effect -- works for BOTH stills and video
+    'fog_enabled': False,          # depth-based atmospheric fog (exponential, optionally height-falloff)
+    'fog_color': (0.62, 0.66, 0.72),  # RGB 0..1, a neutral overcast-sky haze by default
+    'fog_density': 0.006,         # exponential fog coefficient -- higher = thicker/closer-in fog
+    'fog_max_depth': 260.0,       # world units at which fog reaches full strength (also caps how far
+                                   # sky/background pixels -- which report a huge sentinel depth -- get pulled in)
+    'fog_height_falloff': 0.0,    # 0 = uniform fog at all heights, >0 = fog thins out above fog_base_height
+                                   # (an exponential falloff in world Y, like ground mist/haze layers)
+    'fog_base_height': 0.0,       # world Y the height falloff is measured from (ignored if fog_height_falloff is 0)
+    'godrays_enabled': True,      # screen-space crepuscular rays / light shafts from visible lights through sky
+    'godrays_intensity': 0.35,    # additive strength of the ray contribution
+    'godrays_decay': 0.97,        # per-sample falloff along each ray (closer to 1 = rays reach further)
+    'godrays_density': 0.9,       # sample step size as a fraction of the full source->pixel distance
+    'godrays_samples': 24,        # radial samples per pixel per light -- higher = smoother rays, slower
+    'godrays_sky_depth': 5000.0,  # depth (world units) above which a pixel counts as unoccluded "sky"
+                                   # and can act as a ray source (matches the renderer's 1e4 miss sentinel)
+    'vhs_enabled': False,         # VHS tape effect -- works for BOTH stills and video
     'vhs_strength': 1.0,          # overall VHS effect intensity (0..~2)
+    'analog_enabled': True,       # Y2K-camcorder look: crushed/lifted low dynamic range, hard highlight
+                                   # blowout, halation, heavy grain, and (video/live only) a directional
+                                   # motion smear driven by actual camera movement between frames -- distinct
+                                   # from vhs_enabled, which simulates a VIDEO TAPE's electronic artifacts
+                                   # (scanlines, tracking wobble); this simulates the CAMERA/SENSOR side of a
+                                   # cheap consumer camcorder instead, and the two can be combined (e.g. "worn
+                                   # VHS dub of camcorder footage")
+    'analog_strength': 1.0,       # overall intensity multiplier for the whole effect bundle below
+    'analog_contrast': 0.6,       # dynamic-range compression: lifts blacks and soft-knees the top end, the
+                                   # "flat, milky" low-DR look of a small CCD sensor (0 = full range, off)
+    'analog_highlight_clip': 0.55,# 0..1 -- how little headroom highlights get before blowing out to a hard,
+                                   # detail-less white (lower = blows out sooner/harder)
+    'analog_grain': 0.06,         # grain amount (0..~0.15), stronger in shadows/midtones than highlights
+    'analog_grain_size': 1.6,     # grain "clump" size in px -- 1 = fine per-pixel noise, >1 = coarser blobs
+                                   # closer to real CCD/tape noise than flat per-pixel grain
+    'analog_halation': 0.4,       # warm red-orange bleed around bright/blown-out highlights (0 = off)
+    'analog_vignette': 0.4,       # soft optical vignette strength (0..~1)
+    'analog_warmth': 0.08,        # warm-highlight/cool-shadow split-tone strength (0 = neutral)
+    'analog_smear': 0.6,          # extra DIRECTIONAL motion smear, sized from the camera's actual frame-to-
+                                   # frame movement (rotation dominates, like a handheld camcorder) -- video
+                                   # and live preview only (needs a previous pose); stands in for a slow
+                                   # electronic shutter/CCD smear on top of the "real" sampled motion_blur_*
+                                   # below, since that would otherwise need very high samples_per_frame to
+                                   # resolve fast handheld shake smoothly. 0 = off.
+    'analog_smear_max_px': 40,    # cap on smear length (px, at the resolution being rendered) so a fast
+                                   # spin/cut doesn't smear into an unreadable blur or blow up render time
     'motion_blur_enabled': True,  # motion blur -- ONLY affects render_video()
                                    # (simulated via multiple raytrace samples at
                                    # different points in time, not a 2D image blur)
-    'motion_blur_shutter': 0.1,   # "shutter open" fraction of 1 frame (0..1)
+    'motion_blur_shutter': 1.0,   # "shutter open" fraction of 1 frame (0..1)
 }
 
 
@@ -3466,13 +3589,25 @@ def apply_bloom(img, threshold, intensity, radius):
     """Highlight glow: extracts pixels brighter than `threshold` (with a
     soft knee so the cutoff isn't a hard edge), blurs them at 2 radii (a
     tight-ish inner glow + a wide soft outer haze, cheaply approximating
-    a multi-scale/Gaussian-pyramid bloom with just 2 box blurs), and adds
+    a multi-scale/Gaussian-pyramid bloom with just 2 box blurs), and blends
     that back on top of the image -- the "hot" parts of the frame bleed
     light into their surroundings, like a real camera sensor/eye does with
     bright sources. Operates on the already-tonemapped (post
     resolve_output) display image; see the ACES tonemap in resolve_output
     for why that still gives a reasonably smooth brightness gradient to
-    threshold against instead of a flat, hard-edged blob of pure white."""
+    threshold against instead of a flat, hard-edged blob of pure white.
+
+    The glow is SCREEN-BLENDED onto the image (1-(1-a)*(1-b)) instead of
+    just added on top. Straight addition is what made this look like a
+    flashbang: once a bright area's glow pushed a pixel's value past 1.0,
+    the final clamp in apply_post_processing just flattened it to solid
+    white with a hard edge wherever the glow happened to cross that line --
+    visually indistinguishable from overexposure. A screen blend
+    asymptotically approaches 1.0 instead of blowing through it, so bright
+    regions get a smooth, self-limiting highlight rolloff (closer to real
+    sensor/film halation) no matter how strong `intensity` is, while still
+    behaving like ordinary additive glow for the darker majority of the
+    frame where a and b are both small."""
     if intensity <= 0:
         return img
     h, w = img.shape[:2]
@@ -3488,11 +3623,291 @@ def apply_bloom(img, threshold, intensity, radius):
 
     glow_small = _box_blur(bright, r_small)
     glow_large = _box_blur(_box_blur(bright, r_large), r_large)  # 2 passes ~= a wider, softer falloff
-    glow = glow_small * 0.6 + glow_large * 0.4
-    return img + glow * intensity
+    glow = np.clip((glow_small * 0.6 + glow_large * 0.4) * intensity, 0.0, 1.0)
+    return 1.0 - (1.0 - img) * (1.0 - glow)
 
 
-def apply_post_processing(img, depth, flares, post_fx, frame_seed=0):
+def _reconstruct_world_dir_y(depth, half_tan, aspect, R):
+    """Rebuilds the world-space Y component of each pixel's primary ray
+    direction from the camera pose alone (no separate world-position
+    G-buffer exists -- only depth). Matches render_sample's own ray
+    construction exactly (xn/yn normalized screen coords, d_cam = (xn *
+    half_tan * aspect, yn * half_tan, 1.0), ray_dir = R @ d_cam) so that
+    cam_pos.y + world_dir_y * depth reproduces the world-space Y of the
+    point that was actually shaded there. Used by apply_fog's optional
+    height falloff."""
+    h, w = depth.shape
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    xn = (xx / max(w - 1.0, 1.0)) * 2.0 - 1.0
+    yn = 1.0 - (yy / max(h - 1.0, 1.0)) * 2.0
+    d_cam = np.stack([xn * half_tan * aspect, yn * half_tan, np.ones_like(xn)], axis=-1)
+    d_cam /= np.linalg.norm(d_cam, axis=-1, keepdims=True)
+    # d_cam is a row-vector per pixel; world = R @ d_cam (column-vector form)
+    # is the same as d_cam @ R.T in row-vector form.
+    world_dir = d_cam @ R.T
+    return world_dir[..., 1]
+
+
+def apply_fog(img, depth, post_fx, camera_pose=None):
+    """Exponential depth fog: blends the image toward `fog_color` as depth
+    increases (fog_factor = 1 - exp(-depth * density), the standard
+    atmospheric-scattering approximation), with an optional height
+    falloff so the fog can thin out above `fog_base_height` (ground mist)
+    instead of sitting uniformly at every altitude. Sky/background pixels
+    report a huge sentinel depth (see the 1e4 miss case in render_sample),
+    so depth is capped at `fog_max_depth` first -- otherwise those pixels
+    would always compute fog_factor ~= 1 regardless of density and the
+    whole sky would flatten to a solid fog-colored wall instead of a
+    distant haze. camera_pose, if given, is (camera_pos, R, half_tan,
+    aspect) and is only needed when fog_height_falloff > 0."""
+    density = post_fx.get('fog_density', 0.0)
+    if not post_fx.get('fog_enabled', False) or density <= 0:
+        return img
+    max_depth = max(1e-3, post_fx.get('fog_max_depth', 260.0))
+    d = np.clip(depth, 0.0, max_depth)
+    fog_amount = 1.0 - np.exp(-d * density)
+
+    falloff = post_fx.get('fog_height_falloff', 0.0)
+    if falloff > 0.0 and camera_pose is not None:
+        camera_pos, R, half_tan, aspect = camera_pose
+        world_dir_y = _reconstruct_world_dir_y(depth, half_tan, aspect, R)
+        world_y = camera_pos[1] + world_dir_y * d
+        base_h = post_fx.get('fog_base_height', 0.0)
+        fog_amount = fog_amount * np.exp(-np.maximum(world_y - base_h, 0.0) * falloff)
+
+    fog_amount = np.clip(fog_amount, 0.0, 1.0)[..., None]
+    color = np.array(post_fx.get('fog_color', (0.6, 0.65, 0.75)), dtype=np.float32)
+    return img * (1.0 - fog_amount) + color * fog_amount
+
+
+def apply_god_rays(img, depth, flares, post_fx):
+    """Screen-space crepuscular rays / volumetric light shafts (the classic
+    "Volumetric Light Scattering as a Post-Process" radial-blur technique):
+    for each visible light, masks the image down to just the SKY pixels
+    (depth above `godrays_sky_depth` -- i.e. the camera ray reached the
+    background/miss case, matching the renderer's 1e4 sentinel depth, so
+    this is genuinely "can see the light/sky here" and not just "this pixel
+    is bright") near that light, then radially resamples that masked
+    buffer along the line from each screen pixel back toward the light's
+    screen position, accumulating samples with a per-step decay. Occluded
+    (non-sky) geometry between a pixel and the light contributes ~0 along
+    that ray, so solid objects naturally cast dark shaft-shaped shadows
+    through the brighter sky around them -- exactly the "rays streaming
+    around a tree/building" look. Reuses the same `flares` list
+    apply_lens_flare uses (already screen-projected + occlusion-checked
+    against the light itself), so a light has to actually be visible from
+    the camera to cast rays."""
+    intensity = post_fx.get('godrays_intensity', 0.0)
+    if not post_fx.get('godrays_enabled', False) or not flares or intensity <= 0:
+        return img
+    h, w = img.shape[:2]
+    sky_depth = post_fx.get('godrays_sky_depth', 5000.0)
+    n_samples = max(1, int(post_fx.get('godrays_samples', 24)))
+    density = post_fx.get('godrays_density', 0.9)
+    decay = post_fx.get('godrays_decay', 0.97)
+
+    is_sky = depth > sky_depth
+    luma = img[..., 0] * 0.2126 + img[..., 1] * 0.7152 + img[..., 2] * 0.0722
+    src = np.where(is_sky, np.clip(luma, 0.0, 4.0), 0.0).astype(np.float32)
+
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    out = img.copy()
+    for (sx, sy, color, brightness) in flares:
+        if not (-0.3 * w <= sx <= 1.3 * w and -0.3 * h <= sy <= 1.3 * h):
+            continue
+        step_x = (sx - xx) * (density / n_samples)
+        step_y = (sy - yy) * (density / n_samples)
+        cur_x, cur_y = xx.copy(), yy.copy()
+        accum = np.zeros((h, w), dtype=np.float32)
+        falloff = 1.0
+        for _ in range(n_samples):
+            cur_x = cur_x + step_x
+            cur_y = cur_y + step_y
+            ix = np.clip(cur_x, 0, w - 1).astype(np.int32)
+            iy = np.clip(cur_y, 0, h - 1).astype(np.int32)
+            accum += src[iy, ix] * falloff
+            falloff *= decay
+        accum /= n_samples
+        color_arr = np.array(color, dtype=np.float32)
+        out += accum[..., None] * color_arr * intensity * (0.3 + 0.7 * min(1.0, brightness))
+    return out
+
+
+def apply_analog_motion_smear(img, motion_px, strength, max_px):
+    """Cheap DIRECTIONAL smear standing in for a cheap camcorder's slow
+    electronic shutter + CCD charge-smear -- averages several copies of
+    `img` shifted along the (dx, dy) apparent-motion vector (in pixels,
+    computed by _camera_motion_px from the camera's actual pose change
+    since the previous displayed frame). This is intentionally NOT the
+    physically-correct per-object motion blur that render_video's
+    motion_blur_* system already does via real time-jittered raytrace
+    samples (see render_video's docstring) -- that system is limited by
+    samples_per_frame, so resolving FAST handheld shake smoothly through
+    it alone would need many more samples than is practical every frame.
+    This adds a smooth, deterministic streak on top of however many real
+    samples were taken, at the cost of being a uniform whole-frame shift
+    rather than a true per-pixel/per-object blur (fine for the camcorder
+    look being targeted here, where the whole sensor smears together).
+    motion_px: (dx, dy) in screen pixels, or None/zero to skip (stills and
+    the very first frame of a sequence have no previous pose to diff)."""
+    if strength <= 0 or max_px <= 0 or motion_px is None:
+        return img
+    dx, dy = motion_px
+    mag = math.hypot(dx, dy)
+    if mag < 0.05:
+        return img
+    length = min(max_px, mag * strength)
+    if length < 0.4:
+        return img
+    ux, uy = dx / mag, dy / mag
+    n_taps = max(3, min(16, int(round(length)) + 3))
+    h, w = img.shape[:2]
+    src = img.astype(np.float32)
+    acc = np.zeros_like(src)
+    for i in range(n_taps):
+        f = (i / (n_taps - 1)) - 0.5  # -0.5 .. +0.5 along the motion vector
+        ox, oy = ux * length * f, uy * length * f
+        M = np.float32([[1.0, 0.0, ox], [0.0, 1.0, oy]])
+        acc += cv2.warpAffine(src, M, (w, h), flags=cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_REPLICATE)
+    return acc / n_taps
+
+
+def _camera_motion_px(prev_pose, curr_pose, w, h, half_tan, aspect):
+    """Approximates the on-screen pixel shift a point near the center of
+    frame would show between two camera poses -- used only to size
+    apply_analog_motion_smear's streak, not for anything physically exact
+    (a true per-pixel motion vector would also depend on scene depth and
+    camera translation, which this ignores: rotation dominates the blur in
+    handheld/camcorder footage, and that's the dominant term here).
+    prev_pose/curr_pose: (yaw, pitch, roll) radians, or prev_pose is None
+    for "no previous frame" (returns zero motion)."""
+    if prev_pose is None:
+        return 0.0, 0.0
+    p_yaw, p_pitch, _ = prev_pose
+    c_yaw, c_pitch, _ = curr_pose
+    d_yaw = _shortest_angle_diff(p_yaw, c_yaw)
+    d_pitch = c_pitch - p_pitch
+    focal_px_x = (w / 2.0) / max(1e-4, half_tan * aspect)
+    focal_px_y = (h / 2.0) / max(1e-4, half_tan)
+    return -d_yaw * focal_px_x, d_pitch * focal_px_y
+
+
+def apply_analog_camera(img, post_fx, frame_seed=0, motion_px=None):
+    """Y2K-camcorder 'analog camera' look -- deliberately distinct from
+    apply_vhs's tape degradation (which simulates a video SIGNAL's
+    electronic artifacts: scanlines, tracking wobble, chroma crosstalk).
+    This instead models the physical quirks of a cheap consumer camcorder's
+    LENS/SENSOR, applied in this order:
+      1) Dynamic-range compression: lifts blacks and soft-knees the top of
+         the range, the flat/milky "can't hold true black or a graceful
+         highlight rolloff" look of a small CCD sensor + a low-bitrate
+         signal chain (a much narrower usable range than the renderer's
+         native output).
+      2) Highlight blowout: pixels above `analog_highlight_clip` rush to a
+         hard, detail-less white -- a small sensor's clip point, not
+         film's graceful halation rolloff (that's a separate step below).
+      3) Halation: bright/blown highlights bleed a soft, warm red-orange
+         halo into the frame (still present -- footage shot on a camcorder
+         through a cheap lens gets bloom too, just harder-edged than film).
+      4) A gentle warm-highlight / cool-shadow split-tone.
+      5) Grain: coarse-ish (see analog_grain_size), mostly-monochromatic
+         noise plus a little per-channel chroma noise, stronger in
+         shadows/midtones than highlights -- the way real sensor/tape
+         noise behaves (a flat, fine, colorless noise floor reads as
+         clean digital noise instead of a cheap CCD's).
+      6) A soft, smoothly-falling optical vignette.
+      7) Motion smear (video/live only, see apply_analog_motion_smear) --
+         a directional blur sized from the camera's actual movement since
+         the previous frame, standing in for the slow shutter/CCD smear a
+         cheap camcorder adds on top of the renderer's own sampled motion
+         blur.
+    Meant to be combinable with apply_vhs (e.g. "a VHS dub of camcorder
+    footage"), so this never touches scanlines or the overall saturation
+    cut VHS applies -- it stays in its own lane. frame_seed varies the
+    grain per frame for video, same convention as apply_vhs."""
+    strength = post_fx.get('analog_strength', 0.0)
+    if not post_fx.get('analog_enabled', False) or strength <= 0:
+        return img
+    h, w = img.shape[:2]
+    rng = np.random.default_rng(3000 + int(frame_seed))
+    out = img.astype(np.float32).copy()
+
+    def _luma(a):
+        return a[..., 0] * 0.2126 + a[..., 1] * 0.7152 + a[..., 2] * 0.0722
+
+    # 1) Dynamic-range compression -- lift blacks, soft-knee the top half
+    dr = post_fx.get('analog_contrast', 0.0) * strength
+    if dr > 0.0:
+        black_lift = 0.14 * dr
+        out = out * (1.0 - black_lift) + black_lift
+        knee = 0.55
+        over = np.clip(out - knee, 0.0, None)
+        out = np.where(out > knee, knee + over / (1.0 + over * (4.0 * dr)), out)
+
+    # 2) Highlight blowout -- a hard, fast rush to white above the clip point
+    hc = post_fx.get('analog_highlight_clip', 0.0)
+    if hc > 0.0:
+        luma = np.clip(_luma(out), 0.0, 4.0)
+        thresh = max(0.02, 1.0 - hc * 0.9)
+        blow = np.clip((luma - thresh) / max(1e-4, 1.0 - thresh), 0.0, 1.0) ** 0.35
+        out = out + (1.15 - out) * (blow[..., None] * strength)
+
+    # 3) Halation
+    halation = post_fx.get('analog_halation', 0.0)
+    if halation > 0.0:
+        luma_h = _luma(out)
+        hot = np.clip((luma_h - 0.7) / 0.3, 0.0, 1.0)
+        hot = hot * hot
+        scale = min(w, h) / 360.0
+        r = max(2, int(round(16 * scale)))
+        glow = _box_blur(_box_blur(out * hot[..., None], r), r)
+        halation_tint = np.array([1.0, 0.35, 0.15], dtype=np.float32)
+        out = out + glow * halation_tint * halation * strength
+
+    # 4) Warm-highlight / cool-shadow split-tone
+    warmth = post_fx.get('analog_warmth', 0.0)
+    if warmth > 0.0:
+        luma2 = np.clip(_luma(out), 0.0, 1.0)
+        shadow_tint = np.array([-0.02, -0.01, 0.03], dtype=np.float32)
+        highlight_tint = np.array([0.05, 0.02, -0.03], dtype=np.float32)
+        l = luma2[..., None]
+        out = out + (shadow_tint * (1.0 - l) + highlight_tint * l) * warmth * strength
+
+    # 5) Grain -- coarser clumps + a touch of chroma noise, weighted so it
+    #    shows up more in shadows/midtones than highlights
+    grain = post_fx.get('analog_grain', 0.0)
+    if grain > 0.0:
+        luma3 = np.clip(_luma(out), 0.0, 1.0)
+        grain_weight = 1.0 - 0.6 * luma3
+        grain_size = max(1.0, post_fx.get('analog_grain_size', 1.0))
+        gh, gw = max(1, int(round(h / grain_size))), max(1, int(round(w / grain_size)))
+        small = rng.normal(0.0, 1.0, size=(gh, gw)).astype(np.float32)
+        noise = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR) if grain_size > 1.0001 else small
+        out = out + (noise * grain)[..., None] * grain_weight[..., None] * strength
+        small_c = rng.normal(0.0, 1.0, size=(gh, gw, 3)).astype(np.float32)
+        chroma_noise = (cv2.resize(small_c, (w, h), interpolation=cv2.INTER_LINEAR)
+                         if grain_size > 1.0001 else small_c)
+        out = out + chroma_noise * (grain * 0.35) * grain_weight[..., None] * strength
+
+    # 6) Soft optical vignette
+    vignette = post_fx.get('analog_vignette', 0.0)
+    if vignette > 0.0:
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+        d = np.sqrt(((xx - cx) / (w / 2.0)) ** 2 + ((yy - cy) / (h / 2.0)) ** 2)
+        vig = 1.0 - vignette * strength * 0.5 * np.clip(d, 0.0, 1.4) ** 2
+        out = out * vig[..., None]
+
+    # 7) Motion smear (video/live only -- motion_px is None for stills)
+    smear = post_fx.get('analog_smear', 0.0) * strength
+    if smear > 0.0:
+        out = apply_analog_motion_smear(out, motion_px, smear, post_fx.get('analog_smear_max_px', 40))
+
+    return out
+
+
+def apply_post_processing(img, depth, flares, post_fx, frame_seed=0, camera_pose=None, motion_px=None):
     out = img
     if post_fx.get('dof_enabled', False):
         out = apply_depth_of_field(out, depth, post_fx['dof_focus_distance'],
@@ -3503,6 +3918,8 @@ def apply_post_processing(img, depth, flares, post_fx, frame_seed=0):
         out, depth = apply_fisheye(out, depth, strength)
         flares = [(*_fisheye_warp_point(sx, sy, fw, fh, strength), color, brightness)
                   for (sx, sy, color, brightness) in flares]
+    out = apply_fog(out, depth, post_fx, camera_pose=camera_pose)
+    out = apply_god_rays(out, depth, flares, post_fx)
     if post_fx.get('bloom_enabled', False):
         out = apply_bloom(out, post_fx.get('bloom_threshold', 0.62),
                            post_fx.get('bloom_intensity', 0.45), post_fx.get('bloom_radius', 22))
@@ -3510,6 +3927,7 @@ def apply_post_processing(img, depth, flares, post_fx, frame_seed=0):
         out = apply_lens_flare(out, flares, post_fx['flare_size'], post_fx['flare_intensity'],
                                 anamorphic=post_fx.get('flare_anamorphic', 0.0),
                                 halo=post_fx.get('flare_halo', 0.0))
+    out = apply_analog_camera(out, post_fx, frame_seed=frame_seed, motion_px=motion_px)
     if post_fx.get('chroma_enabled', False):
         out = apply_chromatic_aberration(out, post_fx['chroma_strength'])
     if post_fx.get('vhs_enabled', False):
@@ -4369,6 +4787,15 @@ def build_demo_scene():
     except FileNotFoundError as e:
         print(f"(Skipping demo texture: {e} -- replace with your own image path in build_demo_scene())")
 
+    demo_tex = os.path.join(os.path.dirname(os.path.abspath(__file__)), "osage.png")
+    try:
+        scene.add_image((-6.2, 8.4, -3.12), (4.20, 8), demo_tex,
+                         rotation=(0, 0, 0),
+                         roughness=0.15, reflection_k=0.05)
+    except FileNotFoundError as e:
+        print(f"(Skipping demo texture: {e} -- replace with your own image path in build_demo_scene())")
+
+
     # --- WATER BLOCK ---
     # A light-blue transparent water block, IOR = 1.333
     scene.add_water(
@@ -4397,6 +4824,26 @@ def build_mc_scene(schem_path="lim_c.schem", decal_path="miku_wonder.png"):
         scene.add_image((0, 9.95, 4.48), (1.63, 4), decal_path,
                          rotation=(0, 0, 0),
                          roughness=0.15, reflection_k=0.05)
+    return scene
+
+def build_custom_scene():
+    scene = Scene()
+    water_f_pos = (-15, 1, 6)
+    water_s_pos = (-47, 0, -31)
+    water_size = (
+        abs(water_f_pos[0] - water_s_pos[0]),
+        abs(water_f_pos[1] - water_s_pos[1]),
+        abs(water_f_pos[2] - water_s_pos[2]),
+    )
+    water_center = (
+        min(water_f_pos[0], water_s_pos[0]) + water_size[0] / 2,
+        min(water_f_pos[1], water_s_pos[1]) + water_size[1] / 2,
+        min(water_f_pos[2], water_s_pos[2]) + water_size[2] / 2,
+    )
+    scene.add_water(center=water_center, size=water_size, color=(120, 220, 240), transparency=0.8)
+    scene = load_schematic("/home/khang238/Documents/python/wat.schem", scene)
+    scene.add_image((-18.5, 3.92, -7), (2.10, 4), "osage.png", rotation=(math.radians(90), 0, 0), roughness=0.15, reflection_k=0.05)
+    # scene.add_image((-11, 5.98, -4), (1.63, 4), "miku_wonder.png", rotation=(math.radians(90), 0, 0), roughness=0.15, reflection_k=0.05)
     return scene
 
 # =============================================================================
@@ -4526,7 +4973,7 @@ def light_options_menu_cv(canvas, sw, sh, light, idx, camera_pos, camera_rot, ca
     drag numeric text in a plain cv2 window); brightness and (for
     spotlights) cone angle/softness have quick +/- keys since those get
     tweaked far more often. Returns True if anything changed (caller is
-    responsible for tracer.sync_lights()/compute_caustics() afterward,
+    responsible for tracer.sync_lights()/compute_ss() afterward,
     since those are somewhat expensive and shouldn't run on every keypress)."""
     changed = False
     choosing = True
@@ -4666,8 +5113,31 @@ def _build_postfx_params(tracer, post_fx, camera_path, has_camera_data):
     add("  Intensity", pf('bloom_intensity'), spf('bloom_intensity'), 'float', 0.02, 0.0, 3.0)
     add("  Radius (px)", pf('bloom_radius'), spf('bloom_radius'), 'int', 1, 1, 100)
 
+    add("[3] Fog", pf('fog_enabled'), spf('fog_enabled'), 'bool')
+    add("  Density", pf('fog_density'), spf('fog_density'), 'float', 0.001, 0.0, 0.2)
+    add("  Max depth", pf('fog_max_depth'), spf('fog_max_depth'), 'float', 5.0, 1.0, 2000.0)
+    add("  Height falloff", pf('fog_height_falloff'), spf('fog_height_falloff'), 'float', 0.01, 0.0, 2.0)
+    add("  Base height", pf('fog_base_height'), spf('fog_base_height'), 'float', 0.5, -500.0, 500.0)
+
+    add("[4] God rays", pf('godrays_enabled'), spf('godrays_enabled'), 'bool')
+    add("  Intensity", pf('godrays_intensity'), spf('godrays_intensity'), 'float', 0.02, 0.0, 2.0)
+    add("  Decay", pf('godrays_decay'), spf('godrays_decay'), 'float', 0.005, 0.5, 0.999)
+    add("  Density", pf('godrays_density'), spf('godrays_density'), 'float', 0.02, 0.1, 1.5)
+    add("  Samples", pf('godrays_samples'), spf('godrays_samples'), 'int', 1, 1, 96)
+
     add("[V] VHS effect", pf('vhs_enabled'), spf('vhs_enabled'), 'bool')
     add("  Strength", pf('vhs_strength'), spf('vhs_strength'), 'float', 0.05, 0.0, 3.0)
+
+    add("[5] Analog camera (camcorder)", pf('analog_enabled'), spf('analog_enabled'), 'bool')
+    add("  Strength", pf('analog_strength'), spf('analog_strength'), 'float', 0.05, 0.0, 2.0)
+    add("  Dynamic range crush", pf('analog_contrast'), spf('analog_contrast'), 'float', 0.02, 0.0, 1.0)
+    add("  Highlight clip", pf('analog_highlight_clip'), spf('analog_highlight_clip'), 'float', 0.02, 0.0, 1.0)
+    add("  Grain", pf('analog_grain'), spf('analog_grain'), 'float', 0.005, 0.0, 0.2)
+    add("  Grain size", pf('analog_grain_size'), spf('analog_grain_size'), 'float', 0.1, 1.0, 6.0)
+    add("  Halation", pf('analog_halation'), spf('analog_halation'), 'float', 0.02, 0.0, 1.0)
+    add("  Vignette", pf('analog_vignette'), spf('analog_vignette'), 'float', 0.02, 0.0, 1.5)
+    add("  Warmth", pf('analog_warmth'), spf('analog_warmth'), 'float', 0.01, 0.0, 1.0)
+    add("  Motion smear", pf('analog_smear'), spf('analog_smear'), 'float', 0.05, 0.0, 2.0)
 
     add("[M] Motion blur (video only)", pf('motion_blur_enabled'), spf('motion_blur_enabled'), 'bool')
     add("  Shutter", pf('motion_blur_shutter'), spf('motion_blur_shutter'), 'float', 0.05, 0.0, 1.0)
@@ -4745,7 +5215,7 @@ def postfx_menu_cv(canvas, sw, sh, params):
     row_h = max(14, min(24, (sh - header_h - footer_h) // max(1, min(n, 18))))
     viewport = max(1, (sh - header_h - footer_h) // row_h)
 
-    tree_x = 24        # left edge of the tree-line gutter
+    tree_x = 42        # left edge of the tree-line gutter
     root_text_x = 42   # root (FX) label text -- one step in from the gutter
     child_indent = 26  # extra right-shift for a sub-property vs. its root
     child_text_x = root_text_x + child_indent
@@ -5088,7 +5558,8 @@ def main(argv=None):
         loaded = load_scene_file(args.scene)
         scene = loaded['scene']
     elif args.mc_schem:
-        scene = build_mc_scene(schem_path=args.mc_schem)
+        # scene = build_mc_scene(schem_path=args.mc_schem)
+        scene = build_custom_scene()
     else:
         scene = build_demo_scene()
     print(f"Scene: {len(scene.faces)} faces ({len(scene.boxes)} boxes, {len(scene.quads)} image planes)")
@@ -5127,7 +5598,7 @@ def main(argv=None):
         ambient, specular_k, shininess = 0.12, 0.6, 64.0
         caustics_enabled = True
         sky_light_strength, caustic_strength = 0.5, 1.0
-        exposure, eye_adapt_enabled, eye_adapt_speed = 1.0, True, 1.4
+        exposure, eye_adapt_enabled, eye_adapt_speed = 1.0, False, 1.4
 
     if args.live_max_bounce is not None:
         live_max_bounce = args.live_max_bounce
@@ -5324,6 +5795,7 @@ def main(argv=None):
     print("1: toggle wireframe outline | C: toggle caustics")
     print("U: DoF | R: chromatic aberration | N: lens flare | V: VHS | M: motion blur (video only)")
     print("F: fisheye lens | B: bloom | Y: eye adaptation/auto exposure | G: continuous autofocus (video only)")
+    print("3: fog | 4: god rays | 5: analog camera (Y2K camcorder: LDR/blowout/grain/smear)")
     print("H: cycle handheld camera shake (keyframe paths only)")
     print("2: type in an exact camera position/angle | `: open the post-FX/renderer properties menu")
     print("9: render final image | 8: quick render (lower quality) | 0: render video")
@@ -5555,6 +6027,15 @@ def main(argv=None):
             elif ch == 'b' and inp.one_shot('bloom_toggle'):
                 post_fx['bloom_enabled'] = not post_fx['bloom_enabled']
                 print(f"Bloom: {post_fx['bloom_enabled']}")
+            elif ch == '3' and inp.one_shot('fog_toggle'):
+                post_fx['fog_enabled'] = not post_fx['fog_enabled']
+                print(f"Fog: {post_fx['fog_enabled']}")
+            elif ch == '4' and inp.one_shot('godrays_toggle'):
+                post_fx['godrays_enabled'] = not post_fx['godrays_enabled']
+                print(f"God rays: {post_fx['godrays_enabled']}")
+            elif ch == '5' and inp.one_shot('analog_toggle'):
+                post_fx['analog_enabled'] = not post_fx['analog_enabled']
+                print(f"Analog camera: {post_fx['analog_enabled']}")
             elif ch == 'y' and inp.one_shot('eye_adapt_toggle'):
                 tracer.eye_adapt_enabled = not tracer.eye_adapt_enabled
                 print(f"Eye adaptation / auto exposure: {tracer.eye_adapt_enabled}")
@@ -5731,6 +6212,9 @@ def main(argv=None):
             f"fisheye {'on' if post_fx.get('fisheye_enabled', False) else 'off'}  "
             f"bloom {'on' if post_fx.get('bloom_enabled', False) else 'off'}  "
             f"exposure {tracer.exposure:.2f}{'(auto)' if tracer.eye_adapt_enabled else ''}",
+            f"fog {'on' if post_fx.get('fog_enabled', False) else 'off'}  "
+            f"god rays {'on' if post_fx.get('godrays_enabled', False) else 'off'}  "
+            f"analog {'on' if post_fx.get('analog_enabled', False) else 'off'}",
         ]
         draw_hud_text(canvas, WIN_W, WIN_H, tl_lines, tr_lines, bl_lines, br_lines)
 
