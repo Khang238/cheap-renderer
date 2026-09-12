@@ -3073,7 +3073,13 @@ class VideoStreamWriter:
             self._proc.stdin.close()
         except (BrokenPipeError, OSError):
             pass
-        _, stderr = self._proc.communicate()
+        # NOT self._proc.communicate() here -- it would try to flush/close
+        # stdin itself, and stdin is already closed above (closing it is
+        # what tells ffmpeg "no more input, finish encoding and exit").
+        # Read stderr to EOF (blocks until ffmpeg actually exits and closes
+        # its end) instead, then wait() just reaps the now-dead process.
+        stderr = self._proc.stderr.read()
+        self._proc.wait()
         if self._error is not None:
             raise RuntimeError(f"Video encoder failed: {self._error}")
         if self._proc.returncode != 0:
