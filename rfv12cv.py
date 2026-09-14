@@ -299,7 +299,7 @@ VIDEO_DURATION = 17.0             # seconds -- ONLY used when there is EXACTLY 1
                                   # duration from via speed/distance). With >=2 keyframes,
                                   # duration is COMPUTED from distance + speed per keyframe
                                   # (see CameraPath.total_duration).
-VIDEO_SAMPLES_PER_FRAME = 16       # raytrace samples per video frame
+VIDEO_SAMPLES_PER_FRAME = 32      # raytrace samples per video frame
 
 # --- WATER MOTION IN VIDEO (does not affect stills/live) ---------------
 WATER_WAVE_SPEED = 1.0          # multiplier applied to the "time" fed into the water
