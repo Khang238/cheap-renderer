@@ -92,6 +92,13 @@ physics/logic from v8, just with comments translated to English.
    - F10 opens a per-keyframe options menu (position/yaw/pitch/speed/
      duration/zoom) for whichever keyframe the camera is currently aimed
      at, alongside the existing O key.
+   - Scene.add_floor: an "infinitely extending" ground plane (really a
+     big thin box -- same material properties as a box, sized to fall
+     off past the horizon rather than truly unbounded) with a
+     `visibility`/`fog_max_depth` limit to keep the BVH cheap;
+     Scene.add_water_surface is the equivalent convenience for a big flat
+     water layer (delegates to add_water, so it keeps refraction/
+     ripples/caustics).
 """
 
 import argparse
@@ -299,7 +306,7 @@ VIDEO_DURATION = 17.0             # seconds -- ONLY used when there is EXACTLY 1
                                   # duration from via speed/distance). With >=2 keyframes,
                                   # duration is COMPUTED from distance + speed per keyframe
                                   # (see CameraPath.total_duration).
-VIDEO_SAMPLES_PER_FRAME = 32      # raytrace samples per video frame
+VIDEO_SAMPLES_PER_FRAME = 64       # raytrace samples per video frame
 
 # --- WATER MOTION IN VIDEO (does not affect stills/live) ---------------
 WATER_WAVE_SPEED = 1.0          # multiplier applied to the "time" fed into the water
@@ -345,6 +352,12 @@ CAUSTIC_BLUR_PASSES = 2    # number of 3x3 blur passes when post-processing the 
 CAUSTIC_MAX_MULT = 6.0     # cap on the brightness multiplier (avoids runaway bright "fireflies")
                            # -- raised from 4.0 for punchier, more contrasty caustic streaks;
                            # RayTracer.caustic_strength (below) gives a runtime dial on top of this.
+
+FLOOR_DEFAULT_VISIBILITY = 500.0  # world units -- half-extent of Scene.add_floor's default X/Z
+                                   # square when no explicit `visibility`/`fog_max_depth` is given
+                                   # (see there): far enough that the edge falls past the horizon/
+                                   # off-screen for any normal camera height, without the BVH having
+                                   # to hold an actually-unbounded plane (triangle meshes can't).
 
 """
 Standard 16:9 Resolutions
@@ -559,6 +572,70 @@ class Scene:
             bmin = np.array([cx - sx / 2.0, cy - sy / 2.0, cz - sz / 2.0], dtype=np.float32)
             bmax = np.array([cx + sx / 2.0, cy + sy / 2.0, cz + sz / 2.0], dtype=np.float32)
             self.water_blocks.append((bmin, bmax, float(ior)))
+
+    def add_floor(self, y=0.0, color=(120, 120, 120), roughness=0.6, transparency=0.0,
+                  ior=1.5, reflection_k=0.0, visibility=None, thickness=1.0,
+                  fog_max_depth=None):
+        """An "infinitely extending" flat ground plane at height y. In
+        practice this is a big thin box -- the exact same underlying
+        geometry/material system as add_box, so every parameter here
+        (color/roughness/transparency/ior/reflection_k) behaves exactly
+        like it would on a box -- sized just large enough that its edge
+        never actually appears on screen (falls past the horizon/frame
+        edge for any reasonable camera height), rather than truly
+        unbounded, which no triangle-mesh BVH could hold or render
+        without cost proportional to its size.
+
+        visibility: half-extent (world units) of the floor's X/Z square.
+          None (default) picks FLOOR_DEFAULT_VISIBILITY, UNLESS
+          `fog_max_depth` is given (see below).
+        fog_max_depth: if you're also turning on fog (the scene's
+          post_fx['fog_max_depth']), pass it here so the floor only
+          extends a little past where fog would fully hide it anyway
+          (fog_max_depth * 1.15) instead of the full default -- this is
+          the "automatically adjusted when fog is enabled" sizing: pass
+          your fog settings' max depth in, and the floor shrinks its own
+          footprint (and therefore the BVH's/render's cost) to match,
+          without you having to size the two separately. Has no effect
+          if `visibility` is given explicitly.
+        thickness: how "thick" the slab is (world units) -- just gives it
+          well-defined side faces like any other box; invisible from
+          normal above/below viewing angles either way.
+        """
+        if visibility is None:
+            visibility = (float(fog_max_depth) * 1.15 if fog_max_depth is not None
+                          else FLOOR_DEFAULT_VISIBILITY)
+        visibility = max(1.0, float(visibility))
+        thickness = max(0.01, float(thickness))
+        self.ops.append({'method': 'add_floor', 'kwargs': {
+            'y': float(y), 'color': list(int(c) for c in color[:3]),
+            'roughness': float(roughness), 'transparency': float(transparency),
+            'ior': float(ior), 'reflection_k': float(reflection_k),
+            'visibility': visibility, 'thickness': thickness,
+        }})
+        self._add_box_geometry_only(
+            center=(0.0, y - thickness / 2.0, 0.0),
+            size=(visibility * 2.0, thickness, visibility * 2.0),
+            color=color, roughness=roughness, transparency=transparency,
+            ior=ior, reflection_k=reflection_k, rotation=(0.0, 0.0, 0.0))
+
+    def add_water_surface(self, y, color=(160, 230, 255), transparency=0.92, ior=1.333,
+                          visibility=None, thickness=0.5, fog_max_depth=None):
+        """Convenience for a big flat water surface (e.g. a lake/ocean
+        layer sitting above an add_floor() ground) -- same "big thin box
+        that reads as infinite" trick as add_floor, just delegated to
+        add_water() so it keeps water's own refraction/tint/Gerstner-wave
+        ripples/caustics behavior (see add_water). Counts against
+        MAX_WATER_BLOCKS like any other add_water call. `visibility`/
+        `fog_max_depth` mean exactly what they do on add_floor."""
+        if visibility is None:
+            visibility = (float(fog_max_depth) * 1.15 if fog_max_depth is not None
+                          else FLOOR_DEFAULT_VISIBILITY)
+        visibility = max(1.0, float(visibility))
+        thickness = max(0.01, float(thickness))
+        self.add_water(center=(0.0, float(y) - thickness / 2.0, 0.0),
+                        size=(visibility * 2.0, thickness, visibility * 2.0),
+                        color=color, transparency=transparency, ior=ior)
 
     def _add_box_geometry_only(self, center, size, color, roughness, transparency,
                                 ior, reflection_k, rotation):
@@ -2053,9 +2130,9 @@ def _shortest_angle_diff(a, b):
 
 
 class CameraKeyframe:
-    __slots__ = ("pos", "yaw", "pitch", "speed", "duration")
+    __slots__ = ("pos", "yaw", "pitch", "speed", "duration", "zoom")
 
-    def __init__(self, pos, yaw, pitch, speed=1.0, duration=None):
+    def __init__(self, pos, yaw, pitch, speed=1.0, duration=None, zoom=1.0):
         self.pos = np.array(pos, dtype=np.float32)
         self.yaw = float(yaw)
         self.pitch = float(pitch)
@@ -2067,12 +2144,22 @@ class CameraKeyframe:
         # want "this transition takes exactly N seconds" regardless of how
         # far apart the two keyframes are.
         self.duration = None if duration is None else max(1e-4, float(duration))
+        # Optical zoom multiplier (see RayTracer.set_zoom) AT this keyframe --
+        # interpolated linearly across a segment by CameraPath.zoom_at, so a
+        # video can rack the zoom in/out over a path the same way it does
+        # yaw/pitch/position. 1.0 = unzoomed. Kept as a plain per-keyframe
+        # value (not folded into sample()'s return tuple -- see zoom_at's
+        # docstring for why) so it doesn't disturb every existing caller of
+        # sample().
+        self.zoom = max(1.0, float(zoom))
 
     def to_dict(self):
         d = {'pos': [float(x) for x in self.pos], 'yaw': self.yaw,
              'pitch': self.pitch, 'speed': self.speed}
         if self.duration is not None:
             d['duration'] = self.duration
+        if abs(self.zoom - 1.0) > 1e-6:
+            d['zoom'] = self.zoom
         return d
 
 
@@ -2202,6 +2289,38 @@ class CameraPath:
             acc += d
         kf = self.keyframes[-1]
         return kf.pos.copy(), kf.yaw, kf.pitch, phase_acc, 0.0
+
+    def zoom_at(self, t):
+        """Plain linear interpolation of each keyframe's `zoom` field at
+        time t -- kept separate from _raw_pose_at/sample() rather than
+        folded into their return tuple, since sample() is called from a
+        handful of places (interactive live view, render_to_file,
+        render_video, and SensorCameraData's own sample() with a DIFFERENT
+        signature) and changing that shared tuple's shape would risk
+        breaking all of them. render_video's zoom ramp (zoom_speed) uses
+        this as the RACK TARGET for each frame -- the actual rendered zoom
+        eases toward it rather than snapping, so an abrupt jump between two
+        keyframes' zoom values still reads as a lens racking, not a cut.
+        No inertia smoothing (unlike pos/yaw/pitch) -- zoom_speed already
+        provides the "can't change instantly" easing."""
+        n = len(self.keyframes)
+        if n == 0:
+            return 1.0
+        if n == 1:
+            return self.keyframes[0].zoom
+        durs = self.segment_durations()
+        total = sum(durs)
+        t_clamped = max(0.0, min(t, total))
+        acc = 0.0
+        for i, d in enumerate(durs):
+            a, b = self.keyframes[i], self.keyframes[i + 1]
+            last = (i == len(durs) - 1)
+            if t_clamped <= acc + d or last:
+                local_t = (t_clamped - acc) / d if d > 1e-9 else 1.0
+                local_t = max(0.0, min(1.0, local_t))
+                return a.zoom + (b.zoom - a.zoom) * local_t
+            acc += d
+        return self.keyframes[-1].zoom
 
     def _inertia_signature(self):
         """Cheap "did anything the cache depends on change" fingerprint --
@@ -2505,8 +2624,8 @@ class CameraPath:
 
         return pos_off, yaw_off, pitch_off, roll_off
 
-    def add(self, pos, yaw, pitch, speed=1.0, duration=None):
-        self.keyframes.append(CameraKeyframe(pos, yaw, pitch, speed, duration))
+    def add(self, pos, yaw, pitch, speed=1.0, duration=None, zoom=1.0):
+        self.keyframes.append(CameraKeyframe(pos, yaw, pitch, speed, duration, zoom))
         return self.keyframes[-1]
 
     def hold(self, duration=2.0, yaw=None, pitch=None):
@@ -2523,7 +2642,8 @@ class CameraPath:
         last = self.keyframes[-1]
         new_yaw = last.yaw if yaw is None else float(yaw)
         new_pitch = last.pitch if pitch is None else float(pitch)
-        return self.add(last.pos.copy(), new_yaw, new_pitch, speed=last.speed, duration=duration)
+        return self.add(last.pos.copy(), new_yaw, new_pitch, speed=last.speed,
+                         duration=duration, zoom=last.zoom)
 
     def is_camera_data(self):
         return False
@@ -2585,7 +2705,7 @@ class CameraPath:
         cp = CameraPath()
         for kf in items:
             cp.add(kf['pos'], kf.get('yaw', 0.0), kf.get('pitch', 0.0),
-                    kf.get('speed', 1.0), kf.get('duration'))
+                    kf.get('speed', 1.0), kf.get('duration'), kf.get('zoom', 1.0))
         return cp
 
 
@@ -2624,6 +2744,14 @@ class SensorCameraData:
 
     def is_camera_data(self):
         return True
+
+    def zoom_at(self, t):
+        """Sensor-recorded camera data doesn't carry a zoom track (it's an
+        external position/rotation log, not something authored with this
+        renderer's zoom in mind), so this is a constant 1.0 -- exists purely
+        so callers (render_video's zoom ramp) can treat CameraPath and
+        SensorCameraData the same way without a hasattr check."""
+        return 1.0
 
     @staticmethod
     def load(path, multiplier=1.0, offset=(0.0, 0.0, 0.0)):
@@ -3340,6 +3468,15 @@ class RayTracer:
         # smear -- None on this worker's very first rendered frame (no prior
         # pose to diff against yet, so that frame gets no smear).
         prev_rot_roll = None
+        # Whether `camera_path` has an authored zoom track worth following
+        # (>=2 keyframes -- zoom_at() only varies between at least two) --
+        # if so each frame's zoom ramp target below tracks the path itself
+        # (e.g. keyframes placed with different tracer.zoom values, or set
+        # via the F10/O keyframe menu's "Set zoom" option); otherwise it
+        # falls back to self.zoom_target, a single constant zoom for the
+        # whole render (whatever was last set interactively or via
+        # --zoom/--zoom-speed for a headless run).
+        _path_has_zoom_track = hasattr(camera_path, 'keyframes') and len(camera_path.keyframes) >= 2
         try:
             for ri, fi in enumerate(frame_range):
                 t_center = frame_times[fi] if camera_sync else min((fi + 0.5) * dt, total_time)
@@ -3358,12 +3495,13 @@ class RayTracer:
                 # settles onto its target -- the camcorder-style
                 # auto-focus "hunt" only appears while actually zooming.
                 prev_zoom = self.zoom
+                zoom_ramp_target = camera_path.zoom_at(t_center) if _path_has_zoom_track else self.zoom_target
                 zoom_speed = max(1e-4, float(self.zoom_speed))
                 max_delta = zoom_speed * dt
-                if abs(self.zoom_target - self.zoom) > max_delta:
-                    self.zoom += max_delta if self.zoom_target > self.zoom else -max_delta
+                if abs(zoom_ramp_target - self.zoom) > max_delta:
+                    self.zoom += max_delta if zoom_ramp_target > self.zoom else -max_delta
                 else:
-                    self.zoom = self.zoom_target
+                    self.zoom = zoom_ramp_target
                 self.zoom = max(self.zoom_min, min(self.zoom_max, self.zoom))
                 self.fov_deg = self.base_fov_deg / self.zoom
                 self.fov_rad = math.radians(self.fov_deg)
@@ -5523,7 +5661,8 @@ def load_schematic(path, scene, offset=(0, 0, 0)):
 def build_demo_scene():
     scene = Scene()
     # Floor
-    scene.add_box((0, -1, 0), (60, 1, 60), (200, 200, 205), roughness=0.35)
+    # scene.add_box((0, -1, 0), (60, 1, 60), (200, 200, 205), roughness=0.35)
+    scene.add_floor(0, (200, 200, 205), 0.35)
     # Back wall
     scene.add_box((0, 10, 20), (60, 20, 1), (230, 230, 235), roughness=0.6)
     # Glass block (transparent, glass IOR)
@@ -5634,6 +5773,14 @@ ARROW_CODES = {
     'down':  {65364}, # 2621440, 84, 63233, 1, 103
 }                     # ^ those values caused problems on some platforms, so only the 4 "official" cv2.waitKeyEx() codes are kept here.
 
+# Same caveat as ARROW_CODES above -- F-key raw codes from cv2.waitKeyEx()
+# are not consistent across OS/backends either. These are the common X11/
+# GTK keysym values (Linux); if F10 doesn't respond on your platform, run
+# with --print-keys, press F10, and add the printed raw code here.
+FUNCTION_CODES = {
+    'f10': {65479},
+}
+
 
 class InputState:
     def __init__(self):
@@ -5659,12 +5806,15 @@ class InputState:
 
 def classify_key(raw):
     """raw: value from cv2.waitKeyEx(). Returns ('arrow', 'left'/'up'/...),
-    ('char', lowercase_char), or (None, None)."""
+    ('func', 'f10'), ('char', lowercase_char), or (None, None)."""
     if raw == -1:
         return None, None
     for name, codes in ARROW_CODES.items():
         if raw in codes:
             return 'arrow', name
+    for name, codes in FUNCTION_CODES.items():
+        if raw in codes:
+            return 'func', name
     ascii_code = raw & 0xFF
     if 32 <= ascii_code < 127:
         return 'char', chr(ascii_code).lower()
@@ -5682,19 +5832,21 @@ def classify_key(raw):
 
 def keyframe_options_menu_cv(canvas, sw, sh, kf, idx):
     labels = ["1) Speed +0.5 units/s", "2) Speed -0.5 units/s",
-              "3) Enter an exact speed (terminal)", "4) Delete this keyframe", "5) Close (Esc)"]
+              "3) Enter an exact speed (terminal)", "4) Set zoom (terminal)",
+              "5) Delete this keyframe", "6) Close (Esc)"]
     result = ('cancel', None)
     choosing = True
     while choosing:
         canvas[:] = (22, 18, 18)
-        title = f"Camera keyframe #{idx + 1}  --  current speed: {kf.speed:.2f} units/second"
+        title = (f"Camera keyframe #{idx + 1}  --  speed: {kf.speed:.2f} units/second"
+                  f"  --  zoom: {kf.zoom:.2f}x")
         tw = _text_width(title)
         _draw_text_shadow(canvas, title, (sw // 2 - tw // 2, sh // 2 - 90))
         for i, label in enumerate(labels):
             lw = _text_width(label)
             y = sh // 2 - 40 + i * 28
             _draw_text_shadow(canvas, label, (sw // 2 - lw // 2, y))
-        hint = "Press 1-5 to choose -- Esc to close"
+        hint = "Press 1-6 to choose -- Esc to close"
         hwid = _text_width(hint, scale=_HUD_SCALE_SMALL)
         _draw_text_shadow(canvas, hint, (sw // 2 - hwid // 2, sh // 2 - 40 + len(labels) * 28 + 20),
                            color=(155, 160, 160), scale=_HUD_SCALE_SMALL)
@@ -5712,8 +5864,10 @@ def keyframe_options_menu_cv(canvas, sw, sh, kf, idx):
         elif ascii_code == ord('3'):
             result, choosing = ('speed_prompt', None), False
         elif ascii_code == ord('4'):
-            result, choosing = ('delete', None), False
+            result, choosing = ('zoom_prompt', None), False
         elif ascii_code == ord('5'):
+            result, choosing = ('delete', None), False
+        elif ascii_code == ord('6'):
             result, choosing = ('cancel', None), False
 
     if result[0] == 'speed_prompt':
@@ -5723,6 +5877,14 @@ def keyframe_options_menu_cv(canvas, sw, sh, kf, idx):
             result = ('set_speed', max(0.01, float(raw_in)))
         except Exception:
             print("Invalid value -- speed left unchanged.")
+            result = ('cancel', None)
+    elif result[0] == 'zoom_prompt':
+        try:
+            raw_in = input(f"Enter a new zoom for keyframe #{idx + 1} "
+                            f"(1.0 = unzoomed, currently {kf.zoom:.2f}): ")
+            result = ('set_zoom', max(1.0, float(raw_in)))
+        except Exception:
+            print("Invalid value -- zoom left unchanged.")
             result = ('cancel', None)
     return result
 
@@ -6025,6 +6187,11 @@ def _build_postfx_params(tracer, post_fx, camera_path, has_camera_data):
 
     add("[M] Motion blur (video only)", pf('motion_blur_enabled'), spf('motion_blur_enabled'), 'bool')
     add("  Shutter", pf('motion_blur_shutter'), spf('motion_blur_shutter'), 'float', 0.05, 0.0, 1.0)
+
+    add("[;/'] Optical zoom", lambda: tracer.zoom, lambda v: tracer.set_zoom(v),
+        'float', 0.1, 1.0, 8.0)
+    add("  Zoom speed (x/second)", lambda: tracer.zoom_speed,
+        lambda v: setattr(tracer, 'zoom_speed', max(1e-4, v)), 'float', 0.1, 0.05, 20.0)
 
     if not has_camera_data:
         add("Handheld camera shake", lambda: camera_path.handheld_shake,
@@ -6351,6 +6518,15 @@ def parse_args(argv=None):
                     help="Damping for --inertia's spring: 0 = critically damped (smooth ease, no "
                          "overshoot), 1 (default 0.35) = strongly underdamped (visibly bounces past "
                          "the target before settling). Has no effect if --inertia is 0.")
+    p.add_argument('--zoom', type=float, default=1.0,
+                    help="Starting optical zoom multiplier (see the ;/' keys), 1.0 = unzoomed. Also "
+                         "used as the constant zoom for a --headless render/video unless the camera "
+                         "path's keyframes carry their own zoom (F10/O menu's 'Set zoom').")
+    p.add_argument('--zoom-speed', type=float, default=1.0,
+                    help="How fast the optical zoom can rack, in zoom-multiplier/second -- both for "
+                         "the interactive ;/' keys and for render_video's per-frame zoom ramp (also "
+                         "editable live from the ` post-fx menu). Higher = snappier zoom, lower = "
+                         "slower/more cinematic racking.")
     p.add_argument('--multi-gpu', type=str, default='off',
                     help="Split a --headless render across multiple NVIDIA GPUs in separate "
                          "processes (Taichi can't span one kernel launch across GPUs -- see the "
@@ -6504,6 +6680,8 @@ def main(argv=None):
     tracer.eye_adapt_speed = eye_adapt_speed
     tracer.camera_pos = np.array(cam_cfg['pos'], dtype=np.float32)
     tracer.camera_rot = np.array([cam_cfg.get('yaw', 0.0), cam_cfg.get('pitch', 0.0)], dtype=np.float32)
+    tracer.zoom_speed = max(1e-4, float(args.zoom_speed))
+    tracer.set_zoom(float(args.zoom))
 
     # --- --camera-data: sensor recording drives the camera instead of ------
     # hand-placed camera keyframes. The two are mutually exclusive: any
@@ -6651,6 +6829,7 @@ def main(argv=None):
 
     fps_smooth = 0.0
     last_frame_time = time.time()
+    _last_zoom_tick = [time.time()]  # mutable cell for the ;/' zoom ramp below (see there)
 
     replaying = False           # replaying the camera path/sensor data (I key), not rendering
     replay_start_time = 0.0
@@ -6698,8 +6877,9 @@ def main(argv=None):
               f"are disabled; I replays the sensor recording (roll resets to 0 when it ends/stops).")
     else:
         print("P: add a camera keyframe here | J: add a HOLD keyframe (stay put, can still turn) | "
-              "O: edit/delete the targeted keyframe (nearest to crosshair)")
+              "O or F10: edit/delete the targeted keyframe (nearest to crosshair)")
     print("I: replay the camera path (no render)")
+    print("; / ' : zoom out / in (optical zoom -- narrows/widens FOV, see --zoom-speed)")
     print("X: export the current scene/camera/lights/etc to a .json file | Esc: quit")
 
     running = True
@@ -6792,6 +6972,38 @@ def main(argv=None):
             if d_roll:
                 camera_roll += d_roll
 
+        # --- Optical zoom (;/' keys) -- narrows/widens the camera's FOV
+        # like a real zoom lens (see RayTracer.set_zoom). Held keys nudge
+        # the TARGET zoom (same "held tick" pattern as WASD/roll above);
+        # the ACTUAL zoom then eases toward that target at tracer.zoom_speed
+        # (zoom-multiplier/second, adjustable in the post-fx menu /
+        # --zoom-speed) using this loop's own inter-frame time, so it racks
+        # smoothly like a real lens instead of snapping -- render_video
+        # does the equivalent per-frame ramp for recorded video. Runs
+        # whether or not a replay is active, so you can zoom while
+        # previewing a path too. No focal-shift "auto-focus hunt" blur here
+        # -- that effect is video-only (see apply_zoom_focal_shift).
+        zoom_key_step = 0.05
+        if keys.is_held(';'):
+            tracer.zoom_target = max(tracer.zoom_min, tracer.zoom_target - zoom_key_step)
+        if keys.is_held("'"):
+            tracer.zoom_target = min(tracer.zoom_max, tracer.zoom_target + zoom_key_step)
+        _zoom_now = time.time()
+        _zoom_dt = min(0.25, max(0.0, _zoom_now - _last_zoom_tick[0]))
+        _last_zoom_tick[0] = _zoom_now
+        _prev_zoom = tracer.zoom
+        _zoom_max_delta = max(1e-4, tracer.zoom_speed) * _zoom_dt
+        if abs(tracer.zoom_target - tracer.zoom) > _zoom_max_delta:
+            tracer.zoom += _zoom_max_delta if tracer.zoom_target > tracer.zoom else -_zoom_max_delta
+        else:
+            tracer.zoom = tracer.zoom_target
+        tracer.zoom = max(tracer.zoom_min, min(tracer.zoom_max, tracer.zoom))
+        if abs(tracer.zoom - _prev_zoom) > 1e-6:
+            tracer.fov_deg = tracer.base_fov_deg / tracer.zoom
+            tracer.fov_rad = math.radians(tracer.fov_deg)
+            tracer.half_tan = math.tan(tracer.fov_rad / 2)
+            any_input = True
+
         R = camera_matrix(*camera_rot, camera_roll)
 
         n_pt_lights = len(tracer.lights)
@@ -6806,6 +7018,8 @@ def main(argv=None):
                 kf.speed = max(0.01, kf.speed + value)
             elif action == 'set_speed':
                 kf.speed = value
+            elif action == 'set_zoom':
+                kf.zoom = value
             elif action == 'delete':
                 camera_path.remove(kf_idx)
                 print(f"Keyframe #{kf_idx + 1} deleted.")
@@ -6845,7 +7059,7 @@ def main(argv=None):
             any_input = True
         elif kind == 'char':
             ch = val
-            if ch in ('w', 'a', 's', 'd', 'q', 'e', ',', '.'):
+            if ch in ('w', 'a', 's', 'd', 'q', 'e', ',', '.', ';', "'"):
                 inp.note_held(ch)
                 any_input = True
             elif ch == 'esc':
@@ -6963,7 +7177,8 @@ def main(argv=None):
                 if has_camera_data:
                     print("Camera keyframes are disabled while --camera-data is active.")
                 else:
-                    camera_path.add(camera_pos.copy(), camera_rot[0], camera_rot[1], speed=5.0)
+                    camera_path.add(camera_pos.copy(), camera_rot[0], camera_rot[1], speed=5.0,
+                                     zoom=tracer.zoom)
                     print(f"Camera keyframe #{len(camera_path.keyframes)} added.")
             elif ch == 'j' and inp.one_shot('add_hold_keyframe'):
                 if has_camera_data:
@@ -7051,6 +7266,15 @@ def main(argv=None):
                                          camera_path=camera_path, embed_assets=True)
                 except Exception as e:
                     print(f"Export failed: {e}")
+        elif kind == 'func':
+            # F10: per-keyframe options menu -- an alternate binding for the
+            # same action as O (see _open_keyframe_menu above), just reachable
+            # without needing a letter key free of other bindings.
+            if val == 'f10' and inp.one_shot('kf_menu'):
+                if has_camera_data:
+                    print("Camera keyframes are disabled while --camera-data is active.")
+                elif targeted_kf_idx is not None:
+                    _open_keyframe_menu(targeted_kf_idx)
 
         if autofocus_flash > 0.0:
             autofocus_flash = max(0.0, autofocus_flash - 1.0 / 60.0)
@@ -7096,6 +7320,8 @@ def main(argv=None):
             f"pos: {camera_pos[0]:.1f}, {camera_pos[1]:.1f}, {camera_pos[2]:.1f}",
             f"yaw/pitch/roll: {math.degrees(camera_rot[0]):.0f} / {math.degrees(camera_rot[1]):.0f} "
             f"/ {math.degrees(camera_roll):.0f}",
+            f"zoom: {tracer.zoom:.2f}x" + (f" -> {tracer.zoom_target:.2f}x"
+                                            if abs(tracer.zoom_target - tracer.zoom) > 1e-3 else ""),
         ]
         tr_lines = [
             f"live raytrace: {'ON' if live_render else 'off'}",
