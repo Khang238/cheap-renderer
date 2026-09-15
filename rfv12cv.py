@@ -99,6 +99,23 @@ physics/logic from v8, just with comments translated to English.
      Scene.add_water_surface is the equivalent convenience for a big flat
      water layer (delegates to add_water, so it keeps refraction/
      ripples/caustics).
+   - Background.set_sky_gradient paints a proper zenith/horizon/ground
+     gradient sky (adjustable colors + a horizon-bias curve) as the SAME
+     equirectangular image format _sample_background already used for a
+     loaded photo -- no rendering-kernel changes needed. Background.
+     set_sun bakes a dimmable sun/moon disc into that same sky (so it
+     subtly brightens ambient shading via the existing sky_light_strength
+     term, for free); RayTracer.add_sun_light/add_sun optionally also add
+     a REAL distant point Light in the same direction for actual
+     highlights/shadows (works because point lights here have no
+     distance falloff -- see add_sun_light's docstring). See
+     RayTracer.set_sun_intensity for dimming it at runtime.
+   - Background.set_stars scatters a soft-dot star field into the same
+     sky texture (density/min-size/max-size/color-variation all
+     adjustable); update_stars (RayTracer.update_stars, throttled to
+     ~1/second in the interactive loop) advances each star's own slow,
+     seeded twinkle phase for "occasionally shifts slightly in
+     color/brightness" instead of a static field or a strobing one.
 """
 
 import argparse
@@ -788,13 +805,19 @@ class BVH:
 # =============================================================================
 
 class Background:
-    def __init__(self, color=(20, 20, 30), image_path=None, brightness=1.0):
+    def __init__(self, color=(20, 20, 30), image_path=None, brightness=1.0, sky=None, sun=None,
+                 stars=None):
         self.brightness = brightness
         self.image = None
         self.img_h = self.img_w = 1
         self.image_path = image_path
         self.solid = np.array(color[:3], dtype=np.float32) / 255.0
         self.color = tuple(int(c) for c in color[:3])
+        self.sky = None                # gradient params dict, if set_sky_gradient was called
+        self.sun = None                # sun/moon disc params dict, if set_sun was called
+        self.stars = None              # star-field params dict, if set_stars was called
+        self._sky_base_image = None    # the plain gradient, no sun/stars -- see _repaint
+        self._star_field = None        # list of (u, v, size, base_color, phase) -- see set_stars
         if image_path and os.path.exists(image_path):
             img = Image.open(image_path).convert('RGB')
             self.image = np.array(img, dtype=np.float32) / 255.0
@@ -802,16 +825,293 @@ class Background:
             print(f"Background image loaded: {image_path} ({self.img_w}x{self.img_h})")
         elif image_path:
             print(f"Warning: '{image_path}' not found, using solid color instead")
+        if sky is not None:
+            self.set_sky_gradient(**sky)
+        if sun is not None:
+            self.set_sun(**sun)
+        if stars is not None:
+            self.set_stars(**stars)
 
     @property
     def has_image(self):
         return self.image is not None
 
+    def set_sky_gradient(self, zenith_color=(50, 90, 170), horizon_color=(210, 225, 245),
+                          ground_color=(45, 40, 38), curve=1.6, resolution=(384, 192)):
+        """Procedurally paints a vertical-gradient sky -- zenith_color
+        straight up, fading to horizon_color at the horizon, then fading
+        again to ground_color looking straight down -- and installs it as
+        this Background's image. This is the SAME equirectangular image
+        format/lookup _sample_background already uses for a loaded photo
+        (u = azimuth, v = 0 at straight up .. 1 at straight down), so no
+        rendering-kernel changes were needed to support this: it's just a
+        different way of producing that image, in Python, once, at scene
+        setup. Since the ambient/hemisphere-fill term in render_sample
+        already samples this same background along each surface's normal
+        (`sky_light_strength * bg_brightness * sky_col`), a bright zenith
+        or a baked-in sun (see set_sun) SUBTLY LIGHTENS ambient shading on
+        surfaces angled toward them for free, with no separate "sky
+        lighting" system needed.
+
+        `curve` biases how quickly zenith fades to horizon: 1.0 = linear,
+        higher values stay closer to zenith_color longer before rushing
+        to the horizon band, which is closer to how a clear real sky
+        actually looks (paler near the horizon, not a straight gradient).
+        `resolution` (w, h) is the baked texture size -- this is a coarse
+        gradient, so the default (384x192) is already overkill; kept
+        small on purpose so re-baking (e.g. every frame of a day/night
+        cycle via set_sun/RayTracer.set_sun_intensity) stays cheap.
+
+        Re-bakes a previously-set sun/star-field on top of the new
+        gradient (since a fresh gradient would otherwise overwrite them)
+        -- see set_sun's `intensity` / update_stars for animating either
+        afterward instead of re-describing them from scratch every time."""
+        w, h = max(2, int(resolution[0])), max(2, int(resolution[1]))
+        zen = np.array(zenith_color[:3], dtype=np.float32) / 255.0
+        hor = np.array(horizon_color[:3], dtype=np.float32) / 255.0
+        gnd = np.array(ground_color[:3], dtype=np.float32) / 255.0
+        curve = max(0.05, float(curve))
+        rows = np.zeros((h, 3), dtype=np.float32)
+        for iy in range(h):
+            v = iy / max(1, h - 1)          # 0 at top (zenith) .. 1 at bottom (nadir)
+            elev = 1.0 - 2.0 * v            # +1 straight up .. -1 straight down
+            if elev >= 0.0:
+                t = elev ** curve
+                rows[iy] = hor + (zen - hor) * t
+            else:
+                t = min(1.0, (-elev) ** curve)
+                rows[iy] = hor + (gnd - hor) * t
+        self._sky_base_image = np.repeat(rows[:, None, :], w, axis=1).astype(np.float32)
+        self.img_h, self.img_w = h, w
+        self.image_path = None  # procedural now, not file-backed -- see to_dict/from_dict
+        self.sky = {'zenith_color': [int(c) for c in zenith_color[:3]],
+                    'horizon_color': [int(c) for c in horizon_color[:3]],
+                    'ground_color': [int(c) for c in ground_color[:3]],
+                    'curve': curve, 'resolution': [w, h]}
+        if self.stars is not None:
+            self._build_star_field()  # resolution changed -- star pixel positions need rebuilding
+        self._repaint()
+        return self
+
+    def set_sun(self, azimuth_deg=45.0, elevation_deg=35.0, color=(255, 244, 214),
+                intensity=1.0, angular_size_deg=2.0, glow_deg=6.0):
+        """Bakes a bright disc for a sun/moon into this Background's sky
+        image (call set_sky_gradient first -- there's no procedural image
+        to bake onto otherwise; a loaded photo background isn't touched by
+        this). `azimuth_deg` is measured around the horizon (0..360, same
+        convention as the equirectangular u coordinate), `elevation_deg`
+        is 90=straight up, 0=horizon, negative=below the horizon (still
+        drawn -- useful for a sunset glow poking above the horizon band
+        via `glow_deg` even once the disc itself has set). `intensity` is
+        a 0..~3 dimmer -- see RayTracer.set_sun_intensity for changing
+        this at runtime (day/night cycles etc.) without re-specifying the
+        rest. `angular_size_deg` is the disc's apparent angular radius,
+        `glow_deg` a soft halo past its edge so it doesn't look like a
+        flat cutout. For the sun to ALSO cast real specular highlights/
+        shadows (this only affects the visual sky image + the ambient
+        term -- see set_sky_gradient's docstring), separately add a
+        matching distant Light -- see RayTracer.add_sun_light, or just
+        use RayTracer.add_sun which does both at once."""
+        self.sun = {'azimuth_deg': float(azimuth_deg) % 360.0, 'elevation_deg': float(elevation_deg),
+                    'color': [int(c) for c in color[:3]], 'intensity': max(0.0, float(intensity)),
+                    'angular_size_deg': max(0.05, float(angular_size_deg)),
+                    'glow_deg': max(0.0, float(glow_deg))}
+        self._repaint()
+        return self
+
+    def set_stars(self, density=0.0025, min_size=0.5, max_size=1.6, brightness=1.0,
+                  color_variation=0.25, twinkle=0.15, above_horizon_only=True, seed=0):
+        """Scatters a star field across this Background's sky image (call
+        set_sky_gradient first, same requirement as set_sun). Stars are
+        tiny soft dots baked into the same equirectangular texture as the
+        gradient/sun, so they cost nothing per-ray -- just more pixels in
+        an already-cheap texture -- and, like the sun, they subtly add to
+        ambient sky-fill lighting on surfaces facing them (usually
+        negligible individually, but see set_sky_gradient's docstring for
+        why that's automatic here).
+
+        density: stars per sky-texture PIXEL (not world units) -- e.g.
+          the default 0.0025 gives ~180 stars at the default 384x192
+          resolution. Scales with `resolution` if you change it, so a
+          higher-res sky doesn't silently get a denser field.
+        min_size/max_size: each star's radius in PIXELS, picked
+          uniformly at random per star between the two.
+        brightness: overall dimmer on top of each star's own random
+          brightness (which stars: 0..1 uniform per star, so brightness
+          scales that whole range) -- also handy for a dusk/dawn fade
+          alongside set_sun's intensity.
+        color_variation: 0 = every star pure white, higher values let
+          individual stars drift toward a warm or cool tint (a small
+          per-star random RGB offset) -- real starlight isn't perfectly
+          white, just close to it.
+        twinkle: how far each star's brightness wanders over time when
+          you call update_stars(t) (0 = static once baked, higher =
+          more visible flicker) -- "occasionally shift slightly in
+          color" is `twinkle` driving a slow per-star sine, not a true
+          per-frame flicker; see update_stars for actually animating it.
+        above_horizon_only: skip generating stars below elev=0 (default
+          True -- there's usually a floor/ground down there anyway).
+        seed: RNG seed -- the star FIELD (positions/sizes/base colors) is
+          otherwise regenerated identically every call with the same
+          seed, so re-baking (e.g. after set_sky_gradient changes
+          resolution) doesn't reshuffle which stars are where."""
+        self.stars = {'density': max(0.0, float(density)), 'min_size': max(0.1, float(min_size)),
+                      'max_size': max(float(min_size), float(max_size)),
+                      'brightness': max(0.0, float(brightness)),
+                      'color_variation': max(0.0, float(color_variation)),
+                      'twinkle': max(0.0, float(twinkle)),
+                      'above_horizon_only': bool(above_horizon_only), 'seed': int(seed)}
+        self._build_star_field()
+        self._repaint()
+        return self
+
+    def update_stars(self, t):
+        """Advances each star's twinkle phase to time t (seconds) and
+        re-bakes -- call this occasionally (it doesn't need to be every
+        frame; a star field re-bake is cheap but there's no reason to pay
+        for it 60x/second for an effect that's meant to read as a slow,
+        occasional shift, not a strobe) from the interactive loop or a
+        video render to get "stars occasionally shift slightly in
+        color/brightness" instead of a perfectly static field. No effect
+        if set_stars hasn't been called (or twinkle=0 -- nothing would
+        change anyway)."""
+        if self.stars is None or self._star_field is None or self.stars['twinkle'] <= 1e-4:
+            return
+        self._repaint(star_time=t)
+
+    def _build_star_field(self):
+        """(Re)generates the star field's positions/sizes/base colors
+        from self.stars' params -- see set_stars. Deterministic given the
+        same seed/resolution, so calling this again (e.g. from
+        set_sky_gradient when the resolution changes) doesn't reshuffle
+        already-placed stars, just re-projects them onto the new size."""
+        if self.stars is None or self._sky_base_image is None:
+            self._star_field = None
+            return
+        s = self.stars
+        h, w = self.img_h, self.img_w
+        count = max(0, int(round(s['density'] * w * h)))
+        rng = np.random.RandomState(s['seed'])
+        field = []
+        tries = 0
+        while len(field) < count and tries < count * 4 + 100:
+            tries += 1
+            u = rng.uniform(0.0, 1.0)
+            v = rng.uniform(0.0, 1.0)
+            elev = 1.0 - 2.0 * v  # same v convention as set_sky_gradient/set_sun
+            if s['above_horizon_only'] and elev < 0.0:
+                continue
+            size = rng.uniform(s['min_size'], s['max_size'])
+            star_bri = rng.uniform(0.4, 1.0) * s['brightness']
+            tint = (rng.uniform(-1.0, 1.0, size=3) * s['color_variation'])
+            base_color = np.clip(1.0 + tint, 0.0, 1.4).astype(np.float32) * star_bri
+            phase = rng.uniform(0.0, 2.0 * math.pi)
+            twinkle_rate = rng.uniform(0.15, 0.6)  # slow -- "occasionally", not a strobe
+            field.append((u, v, float(size), base_color, float(phase), float(twinkle_rate)))
+        self._star_field = field
+
+    def _paint_stars(self, star_time=0.0):
+        """Paints self._star_field onto self.image (assumes the caller,
+        _repaint, has already reset self.image to the clean base+sun).
+        `star_time` drives each star's twinkle sine -- see update_stars."""
+        if not self._star_field:
+            return
+        h, w = self.img_h, self.img_w
+        twinkle = self.stars['twinkle']
+        for (u, v, size, base_color, phase, rate) in self._star_field:
+            bri_mult = 1.0
+            if twinkle > 1e-4:
+                bri_mult = 1.0 + twinkle * math.sin(star_time * rate + phase)
+                bri_mult = max(0.0, bri_mult)
+            col = np.clip(base_color * bri_mult, 0.0, 2.0)
+            cx, cy = u * (w - 1), v * (h - 1)
+            r = max(0.5, size)
+            pad = int(math.ceil(r)) + 1
+            y0, y1 = max(0, int(cy) - pad), min(h, int(cy) + pad + 1)
+            for iy in range(y0, y1):
+                dyp = iy - cy
+                for ixo in range(-pad, pad + 1):
+                    dist = math.sqrt(ixo * ixo + dyp * dyp)
+                    if dist > r:
+                        continue
+                    ix = (int(cx) + ixo) % w
+                    t = max(0.0, 1.0 - dist / max(1e-4, r))
+                    t = t * t
+                    # Additive-ish (via max, not a blend) so a bright star
+                    # against a bright daytime sky doesn't visibly wash it
+                    # out or darken it -- it only shows up where it's
+                    # actually brighter than what's already there, same as
+                    # how stars in reality only become visible once the
+                    # sky itself is dark enough.
+                    self.image[iy, ix] = np.maximum(self.image[iy, ix], col * t)
+
+    def _paint_sun(self):
+        """Paints the current self.sun disc onto self.image (assumes the
+        caller, _repaint, has already reset self.image to the clean
+        base)."""
+        if self._sky_base_image is None or self.sun is None:
+            return
+        s = self.sun
+        if s['intensity'] <= 1e-4:
+            return  # fully dimmed -- leave the plain gradient, nothing to paint
+        h, w = self.img_h, self.img_w
+        az = math.radians(s['azimuth_deg'])
+        el = math.radians(s['elevation_deg'])
+        # Same direction/UV convention as _sample_background: u = azimuth
+        # around Y, v = 0 straight up .. 1 straight down -- so the disc we
+        # paint here lines up exactly with where a real add_sun_light in
+        # the same azimuth/elevation would actually be in the render.
+        dx, dz = math.sin(az) * math.cos(el), math.cos(az) * math.cos(el)
+        dy = math.sin(el)
+        u = (math.atan2(dx, dz) / (2.0 * math.pi)) % 1.0
+        v = 1.0 - (math.asin(max(-1.0, min(1.0, dy))) / math.pi + 0.5)
+        cx, cy = u * (w - 1), v * (h - 1)
+        col = (np.array(s['color'][:3], dtype=np.float32) / 255.0) * s['intensity']
+        disc_r = max(0.5, s['angular_size_deg'] / 180.0 * h)   # h spans 180 degrees, top to bottom
+        glow_r = disc_r + max(0.0, s['glow_deg'] / 180.0 * h)
+        pad = int(math.ceil(glow_r)) + 1
+        y0, y1 = max(0, int(cy) - pad), min(h, int(cy) + pad + 1)
+        for iy in range(y0, y1):
+            dyp = iy - cy
+            for ixo in range(-pad, pad + 1):
+                dist = math.sqrt(ixo * ixo + dyp * dyp)
+                if dist > glow_r:
+                    continue
+                ix = (int(cx) + ixo) % w  # wraps around the horizon (azimuth 360 == 0)
+                if dist <= disc_r:
+                    self.image[iy, ix] = col
+                else:
+                    t = 1.0 - (dist - disc_r) / max(1e-4, glow_r - disc_r)
+                    t = t * t
+                    self.image[iy, ix] = self.image[iy, ix] * (1.0 - t) + col * t
+
+    def _repaint(self, star_time=0.0):
+        """Rebuilds self.image from _sky_base_image + the current sun (if
+        any) + the current star field (if any), in that order -- ALWAYS
+        starting from the clean cached base rather than painting onto
+        whatever self.image currently holds, so repeated calls (dimming
+        the sun, twinkling the stars, ...) never accumulate a ghost trail
+        of every previous bake. No-op (leaves self.image as whatever it
+        already is -- e.g. a loaded photo) if set_sky_gradient hasn't
+        been called."""
+        if self._sky_base_image is None:
+            return
+        self.image = self._sky_base_image.copy()
+        self._paint_sun()
+        self._paint_stars(star_time=star_time)
+
     def to_dict(self, assets=None):
         d = {'color': list(self.color), 'brightness': float(self.brightness),
+
              'image_path': self.image_path}
         if assets is not None and self.image_path:
             _embed_asset(assets, self.image_path)
+        if self.sky is not None:
+            d['sky'] = dict(self.sky)
+        if self.sun is not None:
+            d['sun'] = dict(self.sun)
+        if self.stars is not None:
+            d['stars'] = dict(self.stars)
         return d
 
     @staticmethod
@@ -819,8 +1119,34 @@ class Background:
         path = d.get('image_path')
         if path and asset_dir is not None:
             path = _resolve_asset_path(path, asset_dir)
-        return Background(color=tuple(d.get('color', (20, 20, 30))),
-                           image_path=path, brightness=float(d.get('brightness', 1.0)))
+        sky = d.get('sky')
+        bg = Background(color=tuple(d.get('color', (20, 20, 30))),
+                        image_path=None if sky else path, brightness=float(d.get('brightness', 1.0)))
+        if sky:
+            bg.set_sky_gradient(zenith_color=tuple(sky.get('zenith_color', (50, 90, 170))),
+                                horizon_color=tuple(sky.get('horizon_color', (210, 225, 245))),
+                                ground_color=tuple(sky.get('ground_color', (45, 40, 38))),
+                                curve=float(sky.get('curve', 1.6)),
+                                resolution=tuple(sky.get('resolution', (384, 192))))
+        sun = d.get('sun')
+        if sun:
+            bg.set_sun(azimuth_deg=float(sun.get('azimuth_deg', 45.0)),
+                      elevation_deg=float(sun.get('elevation_deg', 35.0)),
+                      color=tuple(sun.get('color', (255, 244, 214))),
+                      intensity=float(sun.get('intensity', 1.0)),
+                      angular_size_deg=float(sun.get('angular_size_deg', 2.0)),
+                      glow_deg=float(sun.get('glow_deg', 6.0)))
+        stars = d.get('stars')
+        if stars:
+            bg.set_stars(density=float(stars.get('density', 0.0025)),
+                        min_size=float(stars.get('min_size', 0.5)),
+                        max_size=float(stars.get('max_size', 1.6)),
+                        brightness=float(stars.get('brightness', 1.0)),
+                        color_variation=float(stars.get('color_variation', 0.25)),
+                        twinkle=float(stars.get('twinkle', 0.15)),
+                        above_horizon_only=bool(stars.get('above_horizon_only', True)),
+                        seed=int(stars.get('seed', 0)))
+        return bg
 
 
 class Light:
@@ -3108,6 +3434,109 @@ class RayTracer:
         SPOT_BRIGHTNESS.from_numpy(sbri)
         SPOT_COS_OUTER.from_numpy(scos_o)
         SPOT_COS_INNER.from_numpy(scos_i)
+
+    def add_sun_light(self, azimuth_deg=45.0, elevation_deg=35.0, color=(255, 244, 214),
+                      brightness=1.0, distance=4000.0):
+        """Adds a REAL point Light very far away in the sun's direction, so
+        it casts actual diffuse/specular highlights and shadows on scene
+        geometry -- not just the visual/ambient glow from
+        Background.set_sun. This works with NO rendering-kernel changes
+        because point lights here have no distance falloff at all (see
+        render_sample's direct-lighting loop: `lcol * lbri`, no 1/d^2
+        term), so one placed far enough away behaves exactly like a true
+        directional/sun light while reusing the existing point-light code
+        path unchanged. `azimuth_deg`/`elevation_deg` use the same
+        convention as Background.set_sun -- pass the same values to both
+        (or just use add_sun, which does so for you) so the visual disc
+        and the real light line up. Counts against MAX_LIGHTS like any
+        other light -- sync_lights() will raise if you go over.
+        Returns the Light (dim it later with `light.brightness = ...;
+        tracer.sync_lights()`)."""
+        az = math.radians(azimuth_deg)
+        el = math.radians(elevation_deg)
+        dx, dz = math.sin(az) * math.cos(el), math.cos(az) * math.cos(el)
+        dy = math.sin(el)
+        pos = np.array([dx, dy, dz], dtype=np.float64) * float(distance)
+        light = Light(pos, color=color, brightness=brightness)
+        self.lights.append(light)
+        self.sync_lights()
+        return light
+
+    def add_sun(self, azimuth_deg=45.0, elevation_deg=35.0, color=(255, 244, 214),
+               brightness=1.5, angular_size_deg=2.0, glow_deg=6.0, distance=4000.0,
+               cast_light=True):
+        """Convenience: bakes a sun/moon disc into the sky
+        (Background.set_sun -- call set_sky_gradient on this tracer's
+        background first, there's nothing to bake it onto otherwise) AND,
+        if `cast_light` (default True), also adds a real distant Light in
+        the same direction (add_sun_light) so it casts actual highlights/
+        shadows, not just the ambient sky glow. `elevation_deg` above ~0
+        reads as a sun, a low/negative one with a cooler `color` reads as
+        a moon -- there's no separate "moon" type, just different
+        parameters on the same call (see the module docstring's v12
+        notes). Returns the Light if cast_light else None -- dim the sun
+        later with set_sun_intensity() (visual) and/or
+        `light.brightness = ...; tracer.sync_lights()` (real light),
+        typically together for a day/night cycle."""
+        self.background.set_sun(azimuth_deg=azimuth_deg, elevation_deg=elevation_deg,
+                                color=color, intensity=1.0, angular_size_deg=angular_size_deg,
+                                glow_deg=glow_deg)
+        if BG_FIELD is not None:
+            BG_FIELD.from_numpy(self.background.image)
+        light = None
+        if cast_light:
+            light = self.add_sun_light(azimuth_deg, elevation_deg, color, brightness, distance)
+        self.reset_accumulation()
+        return light
+
+    def set_sun_intensity(self, intensity):
+        """Dims/brightens the sun/moon disc baked into the sky
+        (Background.set_sun) and re-uploads the sky texture to the GPU --
+        also resets accumulation (live view), since the background
+        changed. No effect if no sun has been set (Background.set_sun /
+        add_sun). Does NOT touch a separate add_sun_light's brightness
+        (that's real diffuse/specular light, not the sky's visual/ambient
+        glow) -- dim that directly with `light.brightness = ...;
+        tracer.sync_lights()` if you added one, so a day/night cycle can
+        drive both together."""
+        if self.background.sun is None:
+            return
+        self.background.set_sun(**{**self.background.sun, 'intensity': max(0.0, float(intensity))})
+        if BG_FIELD is not None:
+            BG_FIELD.from_numpy(self.background.image)
+        self.reset_accumulation()
+
+    def add_stars(self, density=0.0025, min_size=0.5, max_size=1.6, brightness=1.0,
+                 color_variation=0.25, twinkle=0.15, above_horizon_only=True, seed=0):
+        """Convenience: Background.set_stars + re-uploads the sky texture
+        to the GPU + resets accumulation. Requires set_sky_gradient to
+        already be set on this tracer's background (a star field bakes
+        into that same procedural texture, same requirement as add_sun).
+        See Background.set_stars for what each parameter does; see
+        update_stars for actually animating the "occasionally shift"
+        twinkle afterward."""
+        self.background.set_stars(density=density, min_size=min_size, max_size=max_size,
+                                  brightness=brightness, color_variation=color_variation,
+                                  twinkle=twinkle, above_horizon_only=above_horizon_only, seed=seed)
+        if BG_FIELD is not None:
+            BG_FIELD.from_numpy(self.background.image)
+        self.reset_accumulation()
+
+    def update_stars(self, t):
+        """Advances the star field's twinkle to time t (seconds) and
+        re-uploads the sky texture -- see Background.update_stars. Cheap,
+        but there's no reason to call this every single frame for an
+        effect that's meant to read as occasional, not a strobe; the
+        interactive live view throttles its own calls to roughly once a
+        second (see the main loop) -- call it yourself at whatever
+        cadence suits a script or video render. No effect if no star
+        field has been set."""
+        if self.background.stars is None:
+            return
+        self.background.update_stars(t)
+        if BG_FIELD is not None:
+            BG_FIELD.from_numpy(self.background.image)
+        self.reset_accumulation()
 
     def _sync_water_blocks(self):
         """Uploads water block AABBs to the GPU (called once in __init__)."""
@@ -5662,9 +6091,8 @@ def build_demo_scene():
     scene = Scene()
     # Floor
     # scene.add_box((0, -1, 0), (60, 1, 60), (200, 200, 205), roughness=0.35)
-    scene.add_floor(0, (200, 200, 205), 0.35)
     # Back wall
-    scene.add_box((0, 10, 20), (60, 20, 1), (230, 230, 235), roughness=0.6)
+    #scene.add_box((0, 10, 20), (60, 20, 1), (230, 230, 235), roughness=0.6)
     # Glass block (transparent, glass IOR)
     scene.add_box((-6, 4, 0), (6, 8, 6), (235, 245, 255), roughness=0.0,
                   transparency=0.95, ior=1.5)
@@ -6130,6 +6558,16 @@ def _build_postfx_params(tracer, post_fx, camera_path, has_camera_data):
         'float', 0.02, 0.0, 2.0)
     add("Sky light strength", lambda: tracer.sky_light_strength,
         lambda v: setattr(tracer, 'sky_light_strength', v), 'float', 0.05, 0.0, 5.0)
+    if tracer.background.sun is not None:
+        add("  Sun/moon intensity", lambda: tracer.background.sun['intensity'],
+            lambda v: tracer.set_sun_intensity(v), 'float', 0.05, 0.0, 3.0)
+    if tracer.background.stars is not None:
+        add("  Star brightness", lambda: tracer.background.stars['brightness'],
+            lambda v: tracer.add_stars(**{**tracer.background.stars, 'brightness': v}),
+            'float', 0.05, 0.0, 3.0)
+        add("  Star twinkle", lambda: tracer.background.stars['twinkle'],
+            lambda v: tracer.add_stars(**{**tracer.background.stars, 'twinkle': v}),
+            'float', 0.05, 0.0, 1.0)
     add("[C] Caustics enabled", lambda: tracer.caustics_enabled,
         lambda v: setattr(tracer, 'caustics_enabled', v), 'bool')
     add("  Caustic strength", lambda: tracer.caustic_strength,
@@ -6642,16 +7080,17 @@ def main(argv=None):
         eye_adapt_enabled = loaded['eye_adapt_enabled']
         eye_adapt_speed = loaded['eye_adapt_speed']
     else:
-        bg = Background(color=(20, 25, 35), image_path="night.png", brightness=1.0)
+        bg = Background(color=(20, 25, 35), image_path="nnight.png", brightness=1.0)
+        #bg.set_sky_gradient((0, 8, 12), (16, 42, 81), curve=0.2, resolution=(1200, 600))
         lights = [
             #Light((-18.41, 29.48, -12.73), (255, 251, 235), 1.1),   # key light, slightly warm
             #Light((-1.47, -4.69, 6.94), (255, 251, 235), 1.0),      # fill light, cooler blue
             #Light((-5.88, 16.79, -13.09), (255, 251, 235), 0.3),
         ]
         spotlights = [
-            SpotLight((0.0, 20.0, -5.0), (0.15, -1.0, 0.25), color=(16, 255, 255), brightness=0.3, cone_angle=14.0, softness=0.04),
-            SpotLight((0.0, 20.0, -5.0), (0.15, -1.0, 0.25), color=(255, 16, 255), brightness=0.3, cone_angle=14.0, softness=0.04),
-            SpotLight((0.0, 20.0, -5.0), (0.15, -1.0, 0.25), color=(255, 255, 16), brightness=0.3, cone_angle=14.0, softness=0.04),
+            #SpotLight((0.0, 20.0, -5.0), (0.15, -1.0, 0.25), color=(16, 255, 255), brightness=0.3, cone_angle=14.0, softness=0.04),
+            #SpotLight((0.0, 20.0, -5.0), (0.15, -1.0, 0.25), color=(255, 16, 255), brightness=0.3, cone_angle=14.0, softness=0.04),
+            #SpotLight((0.0, 20.0, -5.0), (0.15, -1.0, 0.25), color=(255, 255, 16), brightness=0.3, cone_angle=14.0, softness=0.04),
         ]
         fov = 65
         max_bounce = DEFAULT_MAX_BOUNCE
@@ -6682,6 +7121,7 @@ def main(argv=None):
     tracer.camera_rot = np.array([cam_cfg.get('yaw', 0.0), cam_cfg.get('pitch', 0.0)], dtype=np.float32)
     tracer.zoom_speed = max(1e-4, float(args.zoom_speed))
     tracer.set_zoom(float(args.zoom))
+    # tracer.add_stars()
 
     # --- --camera-data: sensor recording drives the camera instead of ------
     # hand-placed camera keyframes. The two are mutually exclusive: any
@@ -6830,6 +7270,8 @@ def main(argv=None):
     fps_smooth = 0.0
     last_frame_time = time.time()
     _last_zoom_tick = [time.time()]  # mutable cell for the ;/' zoom ramp below (see there)
+    _star_clock_start = time.time()
+    _next_star_update = 0.0  # wall-clock time.time() timestamp -- see the star-twinkle throttle below
 
     replaying = False           # replaying the camera path/sensor data (I key), not rendering
     replay_start_time = 0.0
@@ -7291,6 +7733,14 @@ def main(argv=None):
         # call unconditionally -- it's a no-op for any spotlight that
         # doesn't have one attached.
         if tracer.spotlights and tracer.update_spotlight_animations(frame_dt):
+            any_input = True
+
+        # Star twinkle: throttled to roughly once a second (see
+        # RayTracer.update_stars' docstring for why) rather than every
+        # frame -- "occasionally shift slightly", not a strobe.
+        if tracer.background.stars is not None and now_t >= _next_star_update:
+            tracer.update_stars(now_t - _star_clock_start)
+            _next_star_update = now_t + 1.0
             any_input = True
 
         # --- Draw the frame ---
