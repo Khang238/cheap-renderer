@@ -116,6 +116,31 @@ physics/logic from v8, just with comments translated to English.
      ~1/second in the interactive loop) advances each star's own slow,
      seeded twinkle phase for "occasionally shifts slightly in
      color/brightness" instead of a static field or a strobing one.
+
+9) CAMERA ROTATION IS NOW QUATERNION-NATIVE AT ITS CORE:
+   - RayTracer's canonical rotation state is a unit quaternion
+     (RayTracer._camera_quat / camera_quat / set_camera_quat) instead of a
+     yaw/pitch/roll triple; camera_matrix() itself builds its matrix by
+     going through a quaternion (euler_to_quat -> quat_to_matrix) rather
+     than composing Ry/Rx/Rz directly. yaw/pitch/roll remain the public,
+     human-readable interface EVERYWHERE else (interactive keyboard
+     controls, camera keyframes, scene JSON export, the HUD's "yaw/pitch/
+     roll" readout) -- RayTracer.camera_rot/camera_roll are now properties
+     over the quaternion, so existing code that reads/writes them is
+     unaffected. See "2a) QUATERNION CORE" above camera_matrix.
+   - NEW --camera-data format: alongside the original Euler-angle sensor
+     JSON, --camera-data now also accepts a quaternion-native telemetry
+     .txt (e.g. "Map_Race_#01.txt": comma-decimal, ':'-delimited
+     "t:x:y:z:qx:qy:qz:qw" lines, optional trailing "END:<ms>") -- see
+     QuaternionCameraData. load_camera_data() auto-detects which format a
+     given --camera-data file is; both feed the SAME is_camera_data()/
+     sample() interface everywhere downstream. QuaternionCameraData
+     interpolates natively with slerp (quat_slerp) instead of per-axis
+     Euler lerp, and _apply_camera_sample feeds that quaternion straight
+     into RayTracer.set_camera_quat() wherever the renderer actually needs
+     a rotation matrix, skipping the (at gimbal lock, lossy) Euler
+     round-trip -- sample() still also decomposes to yaw/pitch/roll purely
+     for display/back-compat.
 """
 
 import argparse
@@ -227,24 +252,140 @@ mat3 = ti.types.matrix(3, 3, ti.f32)
 #      the ,/./ camera-roll keys in interactive mode.
 #    - rotation_matrix adds Rz(roll) to rotate OBJECTS (boxes, image
 #      planes) around an arbitrary axis (yaw, pitch, roll).
+#
+# 2a) QUATERNION CORE: the renderer's actual canonical rotation state
+#     (RayTracer._camera_quat, see the properties below RayTracer.__init__)
+#     is a unit quaternion (x, y, z, w), not the yaw/pitch/roll triple --
+#     camera_matrix() itself now builds its matrix by going THROUGH a
+#     quaternion (euler_to_quat -> quat_to_matrix) rather than composing
+#     Ry/Rx/Rz by hand. Yaw/pitch/roll remain the public, human-readable
+#     interface used everywhere else in this file (interactive keyboard
+#     controls, camera keyframes, scene JSON, the HUD text) for readability
+#     and backward compatibility -- they're converted to/from the
+#     quaternion at the boundary (see RayTracer.camera_rot/camera_roll
+#     properties and euler_to_quat/quat_to_euler below). Camera-data
+#     sources that are ALREADY quaternion-native (QuaternionCameraData,
+#     loaded from a Map_Race_#NN.txt telemetry file) skip the Euler step
+#     entirely via RayTracer.set_camera_quat()/sample_quat(), which avoids
+#     both the round-trip cost and (at pitch = +-90 deg) gimbal lock.
 # =============================================================================
 
+def quat_normalize(q):
+    """(x,y,z,w) -> unit-length (x,y,z,w). Falls back to the identity
+    rotation for a (near-)zero quaternion rather than dividing by ~0."""
+    x, y, z, w = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+    n = math.sqrt(x * x + y * y + z * z + w * w)
+    if n < 1e-12:
+        return (0.0, 0.0, 0.0, 1.0)
+    inv = 1.0 / n
+    return (x * inv, y * inv, z * inv, w * inv)
+
+
+def quat_multiply(a, b):
+    """Hamilton product a*b, (x,y,z,w) convention -- applying the result to
+    a vector rotates by b FIRST, then a (same composition order as the
+    matrix product R(a) @ R(b))."""
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    )
+
+
+def euler_to_quat(yaw, pitch, roll=0.0):
+    """yaw/pitch/roll (radians, camera_matrix's convention) -> quaternion
+    (x,y,z,w). Builds q_yaw * q_pitch * q_roll (Hamilton product) so it
+    matches camera_matrix's R = Ry(yaw) @ Rx(pitch) @ Rz(roll) exactly."""
+    hy, hp, hr = yaw * 0.5, pitch * 0.5, roll * 0.5
+    qy = (0.0, math.sin(hy), 0.0, math.cos(hy))   # rotation about +Y
+    qp = (math.sin(hp), 0.0, 0.0, math.cos(hp))   # rotation about +X
+    qr = (0.0, 0.0, math.sin(hr), math.cos(hr))   # rotation about +Z
+    return quat_normalize(quat_multiply(quat_multiply(qy, qp), qr))
+
+
+def quat_to_matrix(q):
+    """Unit quaternion (x,y,z,w) -> 3x3 rotation matrix (same active,
+    column-vector convention as camera_matrix/rotation_matrix: R @ v).
+    Normalizes q first so a slerped/lerped or hand-authored not-quite-unit
+    quaternion still produces an orthonormal matrix."""
+    x, y, z, w = quat_normalize(q)
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    return np.array([
+        [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
+        [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+        [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
+    ], dtype=float)
+
+
+def quat_to_euler(q):
+    """Inverse of euler_to_quat -- recovers the (yaw, pitch, roll) triple
+    (radians) that camera_matrix/the HUD expect, from a quaternion. This is
+    a DISPLAY/back-compat decomposition only: like any Euler decomposition
+    it hits gimbal lock at pitch = +-90 deg, where yaw and roll individually
+    become ambiguous (only their sum/difference is well defined) -- roll is
+    arbitrarily pinned to 0 in that case. Anything that actually needs the
+    rotation (not just a readable label for it) should use the quaternion
+    itself (quat_to_matrix / camera_matrix_from_quat) instead."""
+    m = quat_to_matrix(q)
+    sp = max(-1.0, min(1.0, -float(m[1, 2])))
+    pitch = math.asin(sp)
+    if abs(m[1, 2]) < 0.999999:
+        yaw = math.atan2(float(m[0, 2]), float(m[2, 2]))
+        roll = math.atan2(float(m[1, 0]), float(m[1, 1]))
+    else:
+        roll = 0.0  # gimbal lock -- yaw/roll are ambiguous, pin roll to 0
+        yaw = math.atan2(-float(m[2, 0]), float(m[0, 0]))
+    return yaw, pitch, roll
+
+
+def quat_slerp(q0, q1, t):
+    """Spherical linear interpolation between two unit quaternions --
+    constant angular velocity, shortest path, immune to gimbal lock. This
+    is what QuaternionCameraData uses to interpolate between recorded
+    Map_Race samples (as opposed to SensorCameraData/CameraPath, which
+    linearly interpolate yaw/pitch/roll as separate angles). Falls back to
+    a normalized linear blend (nlerp) when the two quaternions are nearly
+    identical, where slerp's formula would divide by ~0."""
+    x0, y0, z0, w0 = quat_normalize(q0)
+    x1, y1, z1, w1 = quat_normalize(q1)
+    dot = x0 * x1 + y0 * y1 + z0 * z1 + w0 * w1
+    if dot < 0.0:  # take the shorter path around the 4D sphere
+        x1, y1, z1, w1, dot = -x1, -y1, -z1, -w1, -dot
+    dot = max(-1.0, min(1.0, dot))
+    if dot > 0.9995:
+        return quat_normalize((
+            x0 + (x1 - x0) * t, y0 + (y1 - y0) * t,
+            z0 + (z1 - z0) * t, w0 + (w1 - w0) * t,
+        ))
+    theta0 = math.acos(dot)
+    theta = theta0 * t
+    sin_theta0 = math.sin(theta0)
+    sin_theta = math.sin(theta)
+    s0 = math.cos(theta) - dot * sin_theta / sin_theta0
+    s1 = sin_theta / sin_theta0
+    return (x0 * s0 + x1 * s1, y0 * s0 + y1 * s1, z0 * s0 + z1 * s1, w0 * s0 + w1 * s1)
+
+
+def camera_matrix_from_quat(q):
+    """Builds the same 3x3 camera-basis matrix as camera_matrix(yaw, pitch,
+    roll), directly from a quaternion -- the preferred entry point wherever
+    a rotation is already available as a quaternion (e.g.
+    QuaternionCameraData.sample_quat / RayTracer.camera_quat), since it
+    skips the Euler round-trip entirely."""
+    return quat_to_matrix(q)
+
+
 def camera_matrix(yaw, pitch, roll=0.0):
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    cp, sp = math.cos(pitch), math.sin(pitch)
-    Ry = np.array([[cy, 0, sy],
-                   [0, 1, 0],
-                   [-sy, 0, cy]], dtype=float)
-    Rx = np.array([[1, 0, 0],
-                   [0, cp, -sp],
-                   [0, sp, cp]], dtype=float)
-    if roll == 0.0:
-        return Ry @ Rx
-    cr, sr = math.cos(roll), math.sin(roll)
-    Rz = np.array([[cr, -sr, 0],
-                   [sr, cr, 0],
-                   [0, 0, 1]], dtype=float)
-    return Ry @ Rx @ Rz
+    """Builds the camera's 3x3 basis matrix by going through a quaternion
+    (see 2a above) rather than composing Ry/Rx/Rz directly -- mathematically
+    identical output, but this is now the renderer's actual rotation core;
+    yaw/pitch/roll stay the public interface for readability/back-compat."""
+    return camera_matrix_from_quat(euler_to_quat(yaw, pitch, roll))
 
 
 def dir_from_yaw_pitch(yaw, pitch):
@@ -3153,6 +3294,192 @@ class SensorCameraData:
 
 
 # =============================================================================
+# 11b-2) QuaternionCameraData -- camera path driven by a QUATERNION-NATIVE
+#        --camera-data telemetry file (e.g. "Map_Race_#01.txt"), as an
+#        alternative to SensorCameraData's Euler-angle JSON format. Same
+#        "is_camera_data()" interface, so it drops into every place main()
+#        already accepts --camera-data (interactive "I" replay,
+#        render_video's camera_path argument) -- see load_camera_data()
+#        below, which auto-detects which of the two formats a given
+#        --camera-data file actually is.
+#
+#        File format (one sample per line, an optional trailing "END:<ms>"
+#        line giving the recording's total length in milliseconds):
+#            t:x:y:z:qx:qy:qz:qw
+#        - fields are ':'-separated; there are always exactly 8 per sample
+#          line (the trailing END line is the one exception, "END:<ms>").
+#        - numbers use a COMMA decimal separator ("-21,486" == -21.486),
+#          matching Map_Race_#01.txt -- NOT thousands-separator commas
+#          (there aren't any numbers big enough for that in this format).
+#        - t is in SECONDS from the start of the recording (unlike the
+#          JSON format's millisecond timestamps); x/y/z is the camera
+#          position; qx/qy/qz/qw is its orientation as a quaternion.
+#
+#        Unlike SensorCameraData (which linearly interpolates yaw/pitch/
+#        roll as three separate angles), QuaternionCameraData interpolates
+#        with quat_slerp -- the numerically correct way to blend two
+#        orientations, and immune to the gimbal-lock artifacts a fast
+#        rotation (e.g. a racing camera looping/rolling hard) can trigger
+#        in per-axis Euler interpolation. sample_quat() exposes that native
+#        interpolation directly; sample() still also returns a decomposed
+#        (yaw, pitch, roll) tuple, purely so every existing consumer of
+#        camera_path.sample() (the HUD text, render_video, autofocus,
+#        flares, ...) keeps working completely unchanged.
+# =============================================================================
+
+class _QuatSample:
+    __slots__ = ("t", "pos", "quat")
+
+    def __init__(self, t, pos, quat):
+        self.t = float(t)
+        self.pos = pos          # np.float32[3]
+        self.quat = quat        # np.float32[4], (x, y, z, w), normalized
+
+
+def _parse_map_race_number(s):
+    """'-21,486' -> -21.486. Map_Race_#NN.txt uses a comma decimal
+    separator throughout (locale-formatted telemetry export), never a
+    thousands separator -- so a plain comma->dot swap is exact."""
+    return float(s.strip().replace(',', '.'))
+
+
+class QuaternionCameraData:
+    """Loaded from a quaternion-native --camera-data telemetry .txt (see
+    the format note above). multiplier/offset behave exactly like
+    SensorCameraData's (applied to position only, orientation is untouched)
+    so both formats share the same --camera-data-multiplier/--camera-data-offset
+    CLI flags."""
+
+    def __init__(self, samples, multiplier=1.0, offset=(0.0, 0.0, 0.0), end_duration=None):
+        self.samples = samples  # list[_QuatSample], t sorted ascending
+        self.multiplier = float(multiplier)
+        self.offset = np.array(offset, dtype=np.float32)
+        self._end_duration = end_duration  # seconds, from a trailing "END:<ms>" line, or None
+
+    def is_camera_data(self):
+        return True
+
+    def zoom_at(self, t):
+        """Same rationale as SensorCameraData.zoom_at: this is a recorded
+        position/orientation log, not something authored with this
+        renderer's optical zoom in mind, so it has no zoom track."""
+        return 1.0
+
+    @staticmethod
+    def load(path, multiplier=1.0, offset=(0.0, 0.0, 0.0)):
+        offset_arr = np.array(offset, dtype=np.float32)
+        samples = []
+        end_ms = None
+        with open(path, 'r', encoding='utf-8') as f:
+            for line_no, raw_line in enumerate(f, start=1):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if line.upper().startswith("END:"):
+                    try:
+                        end_ms = _parse_map_race_number(line.split(':', 1)[1])
+                    except (IndexError, ValueError):
+                        pass  # malformed END line -- just fall back to the last sample's t
+                    continue
+                fields = line.split(':')
+                if len(fields) < 8:
+                    raise ValueError(
+                        f"{path}:{line_no}: expected 8 ':'-separated fields "
+                        f"(t:x:y:z:qx:qy:qz:qw), got {len(fields)}: {line!r}")
+                try:
+                    t, x, y, z, qx, qy, qz, qw = (_parse_map_race_number(f) for f in fields[:8])
+                except ValueError as e:
+                    raise ValueError(f"{path}:{line_no}: couldn't parse a number in {line!r}") from e
+                pos = (np.array([x, y, z], dtype=np.float32) * multiplier) + offset_arr
+                quat = np.array(quat_normalize((qx, qy, qz, qw)), dtype=np.float32)
+                samples.append(_QuatSample(t, pos, quat))
+        if not samples:
+            raise ValueError(f"'{path}' has no samples.")
+        samples.sort(key=lambda s: s.t)
+        end_duration = (end_ms / 1000.0) if end_ms is not None else None
+        return QuaternionCameraData(samples, multiplier=multiplier, offset=offset,
+                                     end_duration=end_duration)
+
+    def total_duration(self):
+        last_t = self.samples[-1].t if self.samples else 0.0
+        if self._end_duration is not None:
+            return max(self._end_duration, last_t)
+        return last_t
+
+    def timestamps(self):
+        return [s.t for s in self.samples]
+
+    def average_fps(self):
+        if len(self.samples) < 2:
+            return 0.0
+        total = self.samples[-1].t - self.samples[0].t
+        if total <= 1e-9:
+            return 0.0
+        return (len(self.samples) - 1) / total
+
+    def sample_quat(self, t):
+        """t (seconds from the start of the recording) -> (pos np.float32[3],
+        quat np.float32[4] (x,y,z,w)), slerp-interpolated between the two
+        nearest samples -- the NATIVE (quaternion) sample, preferred over
+        sample() below wherever a rotation MATRIX is what's actually needed
+        (see _apply_camera_sample / RayTracer.set_camera_quat), since it
+        never touches Euler angles and so can't hit gimbal lock."""
+        n = len(self.samples)
+        if n == 0:
+            return None
+        if n == 1:
+            s = self.samples[0]
+            return s.pos.copy(), s.quat.copy()
+        t = max(0.0, min(t, self.samples[-1].t))
+        lo, hi = 0, n - 1
+        while lo < hi - 1:
+            mid = (lo + hi) // 2
+            if self.samples[mid].t <= t:
+                lo = mid
+            else:
+                hi = mid
+        a, b = self.samples[lo], self.samples[hi]
+        span = b.t - a.t
+        local_t = (t - a.t) / span if span > 1e-9 else 1.0
+        local_t = max(0.0, min(1.0, local_t))
+        pos = a.pos + (b.pos - a.pos) * local_t
+        quat = quat_slerp(a.quat, b.quat, local_t)
+        return pos.astype(np.float32), np.array(quat, dtype=np.float32)
+
+    def sample(self, t):
+        """(pos, yaw, pitch, roll) -- the SAME return shape as CameraPath.
+        sample()/SensorCameraData.sample(), for drop-in backward
+        compatibility with every existing caller. yaw/pitch/roll here are a
+        DISPLAY-ONLY decomposition of the natively-interpolated quaternion
+        (see sample_quat()'s docstring, and quat_to_euler's, for why that
+        decomposition -- not the underlying rotation -- is the only part
+        that can be lossy, at pitch = +-90 deg)."""
+        result = self.sample_quat(t)
+        if result is None:
+            return None
+        pos, quat = result
+        yaw, pitch, roll = quat_to_euler(quat)
+        return pos, float(yaw), float(pitch), float(roll)
+
+
+def load_camera_data(path, multiplier=1.0, offset=(0.0, 0.0, 0.0)):
+    """Auto-detects and loads a --camera-data file as either format this
+    renderer supports:
+      - the original sensor-record JSON (SensorCameraData, Euler pitch/
+        yaw/roll in degrees)
+      - a quaternion-native telemetry .txt like Map_Race_#01.txt
+        (QuaternionCameraData, see its class docstring for the format)
+    Detection sniffs the file's actual content (does it start with a JSON
+    object/array?) rather than trusting the file extension, so a renamed
+    or extensionless export still loads correctly."""
+    with open(path, 'r', encoding='utf-8') as f:
+        head = f.read(4096)
+    if head.lstrip().startswith(('{', '[')):
+        return SensorCameraData.load(path, multiplier=multiplier, offset=offset)
+    return QuaternionCameraData.load(path, multiplier=multiplier, offset=offset)
+
+
+# =============================================================================
 # 11c) LiveCameraStream -- camera pose fed in over the network in REAL TIME,
 #      as an alternative to SensorCameraData's prerecorded JSON file. Same
 #      "is_camera_data()" interface (position/rotation/roll), so it drops
@@ -3286,6 +3613,33 @@ def _compute_video_frame_plan(camera_path, fps, duration, camera_sync):
     return n_frames, frame_times, total_time, camera_sync
 
 
+def _apply_camera_sample(tracer, camera_path, t):
+    """Pushes camera_path's pose at time t onto `tracer`, preferring the
+    NATIVE quaternion (camera_path.sample_quat(t), only present on
+    quaternion-native sources like QuaternionCameraData/Map_Race_#NN.txt)
+    over camera_path.sample(t)'s yaw/pitch/roll decomposition when both are
+    available -- this is what lets quaternion-recorded camera data drive
+    the renderer's core (RayTracer._camera_quat) without an unnecessary,
+    lossy-at-gimbal-lock Euler round-trip. Falls back to the ordinary
+    Euler sample() for every other camera_path type (CameraPath keyframes,
+    SensorCameraData, LiveCameraStream), unchanged from before. Either way,
+    tracer.camera_rot/camera_roll (and the HUD text built from them) keep
+    reading out correct yaw/pitch/roll afterward via their properties."""
+    sample_quat = getattr(camera_path, 'sample_quat', None)
+    if sample_quat is not None:
+        result = sample_quat(t)
+        if result is None:
+            return
+        pos, quat = result
+        tracer.camera_pos = pos.astype(np.float32)
+        tracer.set_camera_quat(quat)
+    else:
+        pos, yaw, pitch, roll = camera_path.sample(t)
+        tracer.camera_pos = pos.astype(np.float32)
+        tracer.camera_rot = np.array([yaw, pitch], dtype=np.float32)
+        tracer.camera_roll = roll
+
+
 class RayTracer:
     def __init__(self, scene: Scene, width=480, height=480, fov=60,
                  max_bounce=DEFAULT_MAX_BOUNCE, background=None, lights=None, spotlights=None,
@@ -3316,9 +3670,19 @@ class RayTracer:
         self.background = background if background is not None else Background()
 
         self.camera_pos = np.array([0.0, 5.0, -25.0], dtype=np.float32)
-        self.camera_rot = np.array([0.0, 0.0], dtype=np.float32)
-        self.camera_roll = 0.0  # radians -- only nonzero via --camera-data sensor replay
-                                 # or the interactive ,/./ roll keys (see camera_matrix)
+        # Canonical rotation state -- a unit quaternion (x,y,z,w). This is
+        # the renderer's actual "core" representation now (see the
+        # quaternion-math section near camera_matrix); camera_rot/
+        # camera_roll are kept as yaw/pitch/roll PROPERTIES over this same
+        # quaternion purely for backward compatibility/readability -- every
+        # existing read/write of self.camera_rot / self.camera_roll
+        # anywhere in this file keeps working unchanged, transparently
+        # converting to/from the quaternion at the boundary. Code that
+        # already HAS a quaternion (e.g. QuaternionCameraData, native
+        # Map_Race_#NN.txt playback) should call set_camera_quat() directly
+        # instead of going through the yaw/pitch/roll setters, to avoid an
+        # unnecessary (and, at gimbal lock, lossy) Euler round-trip.
+        self._camera_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
         self.water_time = 0.0   # seconds -- 0.0 = water ripples stay still (still image/live
                                  # raytrace, same as before); render_video() updates this value
                                  # EVERY frame (or every sub-sample when motion blur is on) so
@@ -3367,6 +3731,49 @@ class RayTracer:
         self.width = self.height = 0
         self.aspect = 1.0
         self._alloc_buffers(width, height)
+
+    # --- Camera rotation: quaternion core, Euler compatibility shell -------
+    # self._camera_quat is the single source of truth. camera_rot (yaw,
+    # pitch) and camera_roll are properties over it so every pre-existing
+    # `tracer.camera_rot = ...` / `tracer.camera_roll = ...` / read anywhere
+    # in this file (interactive loop, render_video, scene JSON, HUD text)
+    # keeps working exactly as before, with the Euler<->quaternion
+    # conversion happening transparently at the boundary.
+    @property
+    def camera_quat(self):
+        """Read-only view of the canonical quaternion (x,y,z,w). Use
+        set_camera_quat() to change it directly (preferred over camera_rot/
+        camera_roll when the caller already has a quaternion, e.g. a
+        QuaternionCameraData sample -- skips the Euler round-trip)."""
+        return self._camera_quat
+
+    def set_camera_quat(self, quat):
+        """Sets the camera's orientation directly from a quaternion
+        (x,y,z,w), normalizing it first. This is the native entry point the
+        renderer's core now expects; camera_rot/camera_roll remain
+        available (and stay in sync) purely for display/back-compat."""
+        self._camera_quat = np.array(quat_normalize(quat), dtype=np.float32)
+
+    @property
+    def camera_rot(self):
+        yaw, pitch, _roll = quat_to_euler(self._camera_quat)
+        return np.array([yaw, pitch], dtype=np.float32)
+
+    @camera_rot.setter
+    def camera_rot(self, value):
+        yaw, pitch = float(value[0]), float(value[1])
+        _yaw0, _pitch0, roll = quat_to_euler(self._camera_quat)
+        self._camera_quat = np.array(euler_to_quat(yaw, pitch, roll), dtype=np.float32)
+
+    @property
+    def camera_roll(self):
+        _yaw, _pitch, roll = quat_to_euler(self._camera_quat)
+        return roll
+
+    @camera_roll.setter
+    def camera_roll(self, value):
+        yaw, pitch, _roll0 = quat_to_euler(self._camera_quat)
+        self._camera_quat = np.array(euler_to_quat(yaw, pitch, float(value)), dtype=np.float32)
 
     def update_spotlight_animations(self, dt):
         """Advances every spotlight's attached SpotLightAnimation (if any)
@@ -3650,7 +4057,12 @@ class RayTracer:
         use a lower bounce cap than self.max_bounce for speed -- see
         LIVE_MAX_BOUNCE / item 5 in the module docstring."""
         bounce = self.max_bounce if max_bounce_override is None else max_bounce_override
-        R = camera_matrix(*self.camera_rot, self.camera_roll)
+        # Straight from the canonical quaternion -- this is the hottest
+        # per-sample call site (every interactive live-view frame runs
+        # through here), so it skips the yaw/pitch/roll round-trip that
+        # camera_matrix(*self.camera_rot, self.camera_roll) would otherwise
+        # do on every single call.
+        R = camera_matrix_from_quat(self._camera_quat)
         cp = self.camera_pos
         self.sync_lights()
         WATER_TIME[None] = float(self.water_time)
@@ -3763,7 +4175,7 @@ class RayTracer:
         resolve/post-processing/save logic without duplicating it."""
         color, depth = self.current_image_float()
         if post_fx and post_fx.get('enabled', True):
-            R = camera_matrix(*self.camera_rot, self.camera_roll)
+            R = camera_matrix_from_quat(self._camera_quat)
             flares = compute_flare_list(self, self.camera_pos, R)
             camera_pose = (self.camera_pos, R, self.half_tan, self.aspect)
             color = apply_post_processing(color, depth, flares, post_fx, camera_pose=camera_pose)
@@ -3799,21 +4211,25 @@ class RayTracer:
                       samples_per_frame=VIDEO_SAMPLES_PER_FRAME, post_fx=None,
                       progress_cb=None, camera_sync=False, frame_subset=None, skip_encode=False):
         """Renders a video following camera_path, which is EITHER a CameraPath
-        (hand-placed camera keyframes) OR a SensorCameraData (--camera-data):
+        (hand-placed camera keyframes) OR recorded --camera-data (either a
+        SensorCameraData, Euler pitch/yaw/roll, or a QuaternionCameraData
+        like Map_Race_#01.txt -- see load_camera_data()):
           - CameraPath, 0 keyframes -> does nothing (safety net; main() already
             blocks this case before calling it).
           - CameraPath, 1 keyframe  -> camera stays STILL for 'duration' seconds.
           - CameraPath, >=2 keyframes -> camera moves LINEARLY along the path,
             duration = the sum of segment_durations() (distance / speed per segment).
-          - SensorCameraData -> duration = the sensor recording's own length
-            (last sample timestamp). If camera_sync is True, EVERY recorded
-            sample becomes exactly one output frame (fps stays as given --
-            only the frame COUNT/timing source changes, see main()'s
+          - SensorCameraData/QuaternionCameraData -> duration = the recording's
+            own length (last sample timestamp). If camera_sync is True, EVERY
+            recorded sample becomes exactly one output frame (fps stays as
+            given -- only the frame COUNT/timing source changes, see main()'s
             --camera-sync / --camera-get-fps handling for how fps itself is set);
             otherwise frames are spaced evenly at 'fps' and each frame's camera
-            pose is linearly interpolated from the recording, same as a
-            CameraPath. Only SensorCameraData carries roll (camera_matrix's
-            3rd angle) -- CameraPath.sample() always returns roll=0.0.
+            pose is interpolated from the recording (slerp for
+            QuaternionCameraData, per-axis lerp for SensorCameraData -- see
+            _apply_camera_sample), same as a CameraPath. Only recorded
+            --camera-data carries roll (camera_matrix's 3rd angle) --
+            CameraPath.sample() always returns roll=0.0.
         motion_blur (post_fx['motion_blur_enabled']) when enabled does NOT use
         a fake 2D blur; it takes multiple raytrace samples at different POINTS
         IN TIME within each frame's "shutter window" and accumulates them
@@ -3954,10 +4370,7 @@ class RayTracer:
                     for s in range(samples_per_frame):
                         frac = (s + np.random.random()) / samples_per_frame
                         tt = t_lo + (t_hi - t_lo) * frac
-                        pos, yaw, pitch, roll = camera_path.sample(tt)
-                        self.camera_pos = pos.astype(np.float32)
-                        self.camera_rot = np.array([yaw, pitch], dtype=np.float32)
-                        self.camera_roll = roll
+                        _apply_camera_sample(self, camera_path, tt)
                         self.water_time = tt * WATER_WAVE_SPEED
                         # Sample spotlight animations at this exact
                         # sub-frame shutter time too, so an animated
@@ -3966,10 +4379,7 @@ class RayTracer:
                         self.set_spotlight_animation_time(tt)
                         self.add_samples(1)
                 else:
-                    pos, yaw, pitch, roll = camera_path.sample(t_center)
-                    self.camera_pos = pos.astype(np.float32)
-                    self.camera_rot = np.array([yaw, pitch], dtype=np.float32)
-                    self.camera_roll = roll
+                    _apply_camera_sample(self, camera_path, t_center)
                     self.water_time = t_center * WATER_WAVE_SPEED
                     # Deterministic, frame-exact spotlight animation (see
                     # SpotLightAnimation) -- NOT wall-clock based like the
@@ -3983,7 +4393,7 @@ class RayTracer:
                     self.exposure += (target_exposure - self.exposure) * adapt_k
 
                 if do_autofocus:
-                    R_af = camera_matrix(*self.camera_rot, self.camera_roll)
+                    R_af = camera_matrix_from_quat(self._camera_quat)
                     forward = R_af[:, 2]
                     probe_depth(float(self.camera_pos[0]), float(self.camera_pos[1]), float(self.camera_pos[2]),
                                 float(forward[0]), float(forward[1]), float(forward[2]))
@@ -3995,7 +4405,7 @@ class RayTracer:
                 curr_rot_roll = (float(self.camera_rot[0]), float(self.camera_rot[1]), float(self.camera_roll))
                 post_fx_on = post_fx.get('enabled', True)
                 if post_fx_on:
-                    R = camera_matrix(*self.camera_rot, self.camera_roll)
+                    R = camera_matrix_from_quat(self._camera_quat)
                     flares = compute_flare_list(self, self.camera_pos, R)
                     camera_pose = (self.camera_pos, R, self.half_tan, self.aspect)
                     motion_px = _camera_motion_px(prev_rot_roll, curr_rot_roll,
@@ -4478,7 +4888,7 @@ class ProgressiveRenderer:
         self.tracer.add_samples(self.samples_per_frame, max_bounce_override=self.tracer.live_max_bounce)
         color, depth = self.tracer.current_image_float()
 
-        R = camera_matrix(*self.tracer.camera_rot, self.tracer.camera_roll)
+        R = camera_matrix_from_quat(self.tracer.camera_quat)
         flares = compute_flare_list(self.tracer, self.tracer.camera_pos, R)
         self._frame_seed += 1
         camera_pose = (self.tracer.camera_pos, R, self.tracer.half_tan, self.tracer.aspect)
@@ -6162,22 +6572,35 @@ def build_mc_scene(schem_path="lim_c.schem", decal_path="miku_wonder.png"):
 
 def build_custom_scene():
     scene = Scene()
-    water_f_pos = (-15, 3.8, 30)
-    water_s_pos = (-47, 0, -31)
-    water_size = (
-        abs(water_f_pos[0] - water_s_pos[0]),
-        abs(water_f_pos[1] - water_s_pos[1]),
-        abs(water_f_pos[2] - water_s_pos[2]),
-    )
-    water_center = (
-        min(water_f_pos[0], water_s_pos[0]) + water_size[0] / 2,
-        min(water_f_pos[1], water_s_pos[1]) + water_size[1] / 2,
-        min(water_f_pos[2], water_s_pos[2]) + water_size[2] / 2,
-    )
-    scene.add_water(center=water_center, size=water_size, color=(120, 220, 240), transparency=0.8)
-    scene = load_schematic("/home/khang238/Documents/python/watar.schem", scene)
-    scene.add_image((-18.6, 4.32, -7), (2.10, 4), "osage.png", rotation=(math.radians(90), 0, 0), roughness=0.15, reflection_k=0.05)
-    # scene.add_image((-11, 5.98, -4), (1.63, 4), "miku_wonder.png", rotation=(math.radians(90), 0, 0), roughness=0.15, reflection_k=0.05)
+    # floor
+    scene.add_box((0, -1.01, 0), (64, 1, 104), (126, 142, 135), roughness=0.82, reflection_k=0.05)
+    scene.add_water_surface(-1.1, (120, 220, 240), transparency=0.02)
+    scene.add_image((0, -0.5, 0), (100, 60), "field.png", rotation=(math.radians(90), math.radians(90), 0), roughness=0.82, reflection_k=0.05)
+
+    # first race gate
+    scene.add_box((-24, 2.5, -7), (0.5, 6, 0.5), (255, 14, 210), roughness=0.0, transparency=0.95, ior=1.5)
+    scene.add_box((-20, 2.5, -7), (0.5, 6, 0.5), (255, 14, 210), roughness=0.0, transparency=0.95, ior=1.5)
+
+    # checkpoint gate
+    scene.add_box((-17, 2.5, 20), (1, 6, 1), (255, 210, 14), roughness=0.0, transparency=0.95, ior=1.5)
+    scene.add_box((-23, 2.5, 42), (1, 6, 1), (14, 210, 255), roughness=0.0, transparency=0.95, ior=1.5)
+
+    # lazy race gates
+    scene.add_box((12, -0.25, 20), (4, 0.5, 0.5),  (255, 213, 28), roughness=0.0, transparency=0.95, ior=1.5)
+    scene.add_box((20, -0.25, -6), (4, 0.5, 0.5),  (255, 213, 28), roughness=0.0, transparency=0.95, ior=1.5)
+    scene.add_box((23, -0.25, -35), (4, 0.5, 0.5), (255, 213, 28), roughness=0.0, transparency=0.95, ior=1.5)
+
+    # two football gates - use concrete material
+    scene.add_box((-8, 3.5, -50), (0.5, 8, 0.5), (255, 255, 255), roughness=0.36, reflection_k=0.05)
+    scene.add_box((8, 3.5, -50), (0.5, 8, 0.5), (255, 255, 255), roughness=0.36, reflection_k=0.05)
+    scene.add_box((0, 7.25, -50), (16, 0.5, 0.5), (255, 255, 255), roughness=0.36, reflection_k=0.05)
+
+    scene.add_box((-8, 3.5, 50), (0.5, 8, 0.5), (255, 255, 255), roughness=0.36, reflection_k=0.05)
+    scene.add_box((8, 3.5, 50), (0.5, 8, 0.5), (255, 255, 255), roughness=0.36, reflection_k=0.05)
+    scene.add_box((0, 7.25, 50), (16, 0.5, 0.5), (255, 255, 255), roughness=0.36, reflection_k=0.05)
+
+    # pilot png with shutterstock.com watermark still on
+    scene.add_image((-19, 3.3, -42), (10, 7.6), "man.png", rotation=(0, 0, 0), roughness=0.15, reflection_k=0.05)
     return scene
 
 # =============================================================================
@@ -6908,11 +7331,15 @@ def parse_args(argv=None):
     p.add_argument('--print-keys', action='store_true',
                     help="Debug: print the raw code of every key pressed in the interactive window.")
     p.add_argument('--camera-data', type=str, default=None,
-                    help="Load a sensor_record JSON file and drive the camera position/rotation "
-                         "from it instead of the scene's camera keyframes (mutually exclusive with "
-                         "camera keyframes -- any existing keyframes on the loaded/built scene are "
-                         "dropped). Position is x/y/z (m), rotation is x/y/z (deg, mapped to "
-                         "pitch/yaw/roll). See --camera-multiplier / --camera-offset / --camera-sync.")
+                    help="Load a recorded camera path and drive the camera position/rotation from "
+                         "it instead of the scene's camera keyframes (mutually exclusive with camera "
+                         "keyframes -- any existing keyframes on the loaded/built scene are dropped). "
+                         "Format is auto-detected: either a sensor_record JSON (position x/y/z in m, "
+                         "rotation x/y/z in deg mapped to pitch/yaw/roll) or a quaternion-native "
+                         "telemetry .txt like Map_Race_#01.txt (comma-decimal, ':'-delimited "
+                         "'t:x:y:z:qx:qy:qz:qw' lines, t in seconds, optional trailing 'END:<ms>' -- "
+                         "see QuaternionCameraData). See --camera-multiplier / --camera-offset / "
+                         "--camera-sync.")
     p.add_argument('--camera-multiplier', type=float, default=1.0,
                     help="With --camera-data: multiplies every sample's position (x/y/z) by this "
                          "factor before applying --camera-offset.")
@@ -7057,9 +7484,10 @@ def main(argv=None):
         scene = loaded['scene']
     elif args.mc_schem:
         # scene = build_mc_scene(schem_path=args.mc_schem)
-        scene = build_custom_scene()
+        pass
     else:
-        scene = build_demo_scene()
+        scene = build_custom_scene()
+        # scene = build_demo_scene()
     print(f"Scene: {len(scene.faces)} faces ({len(scene.boxes)} boxes, {len(scene.quads)} image planes)")
 
     if loaded is not None:
@@ -7080,7 +7508,7 @@ def main(argv=None):
         eye_adapt_enabled = loaded['eye_adapt_enabled']
         eye_adapt_speed = loaded['eye_adapt_speed']
     else:
-        bg = Background(color=(20, 25, 35), image_path="nnight.png", brightness=1.0)
+        bg = Background(color=(20, 25, 35), image_path="sky.png", brightness=1.0)
         #bg.set_sky_gradient((0, 8, 12), (16, 42, 81), curve=0.2, resolution=(1200, 600))
         lights = [
             #Light((-18.41, 29.48, -12.73), (255, 251, 235), 1.1),   # key light, slightly warm
@@ -7146,12 +7574,18 @@ def main(argv=None):
     if args.camera_data:
         cam_multiplier = args.camera_multiplier
         cam_offset = _parse_xyz(args.camera_offset) if args.camera_offset else (0.0, 0.0, 0.0)
-        sensor_data = SensorCameraData.load(args.camera_data, multiplier=cam_multiplier, offset=cam_offset)
+        # load_camera_data auto-detects the format: the original Euler-angle
+        # sensor-record JSON, or a quaternion-native telemetry .txt like
+        # Map_Race_#01.txt (see QuaternionCameraData) -- either way,
+        # sensor_data ends up with the same is_camera_data()/sample()
+        # interface from here on.
+        sensor_data = load_camera_data(args.camera_data, multiplier=cam_multiplier, offset=cam_offset)
         if len(camera_path.keyframes) > 0:
             print(f"--camera-data given -- dropping {len(camera_path.keyframes)} existing camera "
-                  f"keyframe(s) from the scene in favor of the sensor recording.")
+                  f"keyframe(s) from the scene in favor of the recorded camera data.")
         camera_path = CameraPath()
-        print(f"Loaded {len(sensor_data.samples)} camera samples from '{args.camera_data}' "
+        kind = "quaternion" if isinstance(sensor_data, QuaternionCameraData) else "sensor"
+        print(f"Loaded {len(sensor_data.samples)} {kind} camera samples from '{args.camera_data}' "
               f"({sensor_data.total_duration():.2f}s)")
         if args.camera_get_fps:
             avg_fps = sensor_data.average_fps()
