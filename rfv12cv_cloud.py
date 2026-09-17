@@ -133,6 +133,97 @@ physics/logic from v8, just with comments translated to English.
      written in) -- please test on your machine before relying on it,
      and see set_clouds' docstring for the quality/perf knobs
      (steps/light_steps) if it's slow.
+
+9) CAMERA ORIENTATION IS NOW QUATERNION-BASED. A unit quaternion
+   [w, x, y, z] is the canonical representation throughout the core
+   camera logic -- storage (RayTracer._camera_quat), composition
+   (camera_matrix/rotation_matrix both build their matrix from one),
+   interpolation (CameraPath and SensorCameraData both slerp instead of
+   lerping yaw/pitch/roll independently), and inertia smoothing (a real
+   rotational spring in quaternion space, _quat_spring_step). Euler
+   angles survive only as a human-readable format at the edges: HUD
+   readouts, the F5/F6/` menus, the manual-camera prompt, scene-file
+   fields, and the interactive arrow-key look (which is literally a
+   yaw/pitch delta, so it stays Euler and is converted once per frame at
+   that boundary). See the comment block above camera_matrix.
+   - Backward compatible: scene JSONs from older versions carry only
+     yaw/pitch, and are converted to a quaternion on load. Scenes saved
+     by this version write yaw/pitch/roll (readable) AND an exact 'quat'
+     field, preferring 'quat' on load when present.
+   - The new quaternion code reproduces the old trig matrices to ~1e-15,
+     so no existing scene renders differently because of this change.
+
+10) --camera-data now reads a plain-text quaternion track (e.g.
+   'Map_Race_#01.txt') as well as the original sensor_record JSON --
+   formats are auto-detected. Text format: one ':'-separated sample per
+   line, `t:pos_x:pos_y:pos_z:qx:qy:qz:qw`, decimal comma or dot, with
+   an optional trailing 'END:<n>' line. Its orientation is already a
+   quaternion, so it needs no Euler conversion on the way in.
+   - --camera-offset now takes 6 values as well as 3: 'x,y,z' (position
+     only, as before) or 'x,y,z,r,p,y' / 'x,y,z/r,p,y' to add a rotation
+     offset in degrees. The new --camera-rot-offset 'r,p,y' flag is the
+     preferred way to give the rotation half, and wins if both appear.
+   - --inertia/--inertia-bounce now apply to --camera-data replay, not
+     just to keyframe paths (previously they were set on a camera_path
+     that --camera-data then discarded, so they silently did nothing).
+     SensorCameraData runs the same position spring plus the quaternion
+     rotational spring over the recording, smoothing its own jitter and
+     abrupt direction changes; 0 keeps the exact raw-data behaviour.
+     Also editable live from the F6 camera menu.
+
+11) SUN AND STARS ARE TOGGLEABLE, and the star twinkle cadence is
+   configurable. Background.sun_enabled/stars_enabled hide either layer
+   while KEEPING all of its settings (angle, color, size, density, seed),
+   so it can be switched straight back on instead of being re-described
+   -- unlike set_sun(intensity=0), which overwrites the stored intensity.
+   RayTracer.set_sun_enabled/toggle_sun also mute/unmute the real distant
+   sun Light (remembering its brightness), so the toggle covers the disc
+   AND the light it casts rather than leaving an invisible sun still
+   throwing shadows. The interactive view's star-twinkle re-bake, which
+   was hard-coded to once a second, is now
+   RayTracer.star_update_interval (0 = frozen field, and cheapest).
+   New flags: --no-sun, --no-stars, --star-update-interval.
+   In the F5 world menu, sun/moon and stars are now their own top-level
+   trees ("[Sun/moon]", "[Stars]"), each led by an Enabled row, instead
+   of the star rows hanging off "Sky light" as though they belonged to
+   it.
+
+12) SCENE EXPORT (X key / --export-scene) IS COMPLETE. save_scene_file
+   additionally writes the volumetric cloud layer, the full optical-zoom
+   state (base_fov_deg/zoom/zoom_target/zoom_speed/zoom_min/zoom_max),
+   star_update_interval, the sun/stars enable flags, and a
+   sun_light_index identifying which entry in lights[] is the sun's own
+   distant Light, so a reload can re-point tracer.sun_light and keep
+   set_sun_angle/set_sun_enabled working on it. Every field added here
+   defaults on load to the renderer's previous behaviour, so older scene
+   files still load identically.
+   - Fixed alongside this: main() called tracer.add_sun()/add_stars()
+     UNCONDITIONALLY, so loading a scene overwrote its sun/star field
+     with the defaults and appended a SECOND sun Light on every reload.
+     Those defaults now only run for a freshly-built scene.
+
+13) GIMBAL-LOCK FIX in euler_from_quat. The standard decomposition reads
+   yaw from R[0,2]/R[2,2] and roll from R[1,0]/R[1,1], but all four of
+   those elements carry a cos(pitch) factor, so at pitch = +-90deg they
+   are all zero and atan2(0, 0) quietly returns 0 -- reporting
+   yaw = roll = 0 for a camera that is actually rotated, and recomposing
+   to the WRONG rotation (off by up to 90deg). Recordings do hit this
+   exactly: 'Map_Race_#01.txt' passes through pitch = 90deg at t ~= 7.4s.
+   Now yaw and roll are folded together into yaw (roll = 0) there, which
+   round-trips exactly. This affected the HUD readout, the readable
+   yaw/pitch/roll in exported scenes, and free-look resuming after a
+   replay ended at such a pose.
+   - Note on that file specifically: its one visible "snap" is NOT gimbal
+     lock and not a renderer bug. It stores each quaternion component to
+     ONE decimal place (position gets three), i.e. ~5.7deg of orientation
+     resolution, and the rounding produces a genuine 42.8deg step between
+     two consecutive samples at t ~= 16.2s. No interpolation can recover
+     that -- slerp faithfully reproduces what it is given. SensorCameraData
+     .load now detects coarse rotation precision and prints the resolution,
+     the worst step and its timestamp, suggesting --inertia; measured at
+     that spot, per-frame motion drops from 7.1deg to 3.2deg at
+     --inertia 0.3 and 1.8deg at 0.6. Re-exporting the track with more
+     decimals is the real fix.
 """
 
 import argparse
@@ -244,24 +335,173 @@ mat3 = ti.types.matrix(3, 3, ti.f32)
 #      the ,/./ camera-roll keys in interactive mode.
 #    - rotation_matrix adds Rz(roll) to rotate OBJECTS (boxes, image
 #      planes) around an arbitrary axis (yaw, pitch, roll).
+#
+#    QUATERNIONS: as of v12's camera-data/inertia rework, a unit quaternion
+#    [w, x, y, z] (Hamilton, np.float64) is the CANONICAL representation of
+#    camera (and camera-path/camera-data) orientation everywhere in the
+#    core logic below -- composition (camera_matrix/rotation_matrix),
+#    interpolation (CameraPath/SensorCameraData sampling), and inertia
+#    smoothing (the rotational spring in _quat_spring_step) all operate on
+#    quaternions directly, never on yaw/pitch/roll. Euler angles are kept
+#    ONLY as a human-readable in/out format at the edges (HUD text, menus,
+#    scene-file readability, older scene files, keyboard input deltas) and
+#    are converted to/from a quaternion right at that boundary -- see
+#    RayTracer.camera_rot/camera_roll (properties backed by camera_quat)
+#    and euler_from_quat/quat_from_euler below. This avoids gimbal lock in
+#    interpolation/smoothing and means a single slerp (not three separate,
+#    independently-unwrapped angle lerps) drives all path/replay blending.
 # =============================================================================
 
+def quat_identity():
+    return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+
+
+def quat_normalize(q):
+    q = np.asarray(q, dtype=np.float64)
+    n = np.linalg.norm(q)
+    return q / n if n > 1e-12 else quat_identity()
+
+
+def quat_from_axis_angle(axis, angle):
+    axis = normalize(np.asarray(axis, dtype=np.float64))
+    h = angle * 0.5
+    s = math.sin(h)
+    return np.array([math.cos(h), axis[0] * s, axis[1] * s, axis[2] * s], dtype=np.float64)
+
+
+def quat_multiply(q1, q2):
+    """Hamilton product q1*q2: applying the result to a vector matches
+    applying q2's rotation first, then q1's -- same composition order as
+    matrix multiplication R1 @ R2 (so q_total = qy*qx*qz mirrors
+    R = Ry*Rx*Rz below)."""
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return np.array([
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ], dtype=np.float64)
+
+
+def quat_conjugate(q):
+    w, x, y, z = q
+    return np.array([w, -x, -y, -z], dtype=np.float64)
+
+
+def quat_from_euler(yaw, pitch, roll=0.0):
+    """Quaternion equivalent of camera_matrix's R = Ry(yaw)*Rx(pitch)*
+    Rz(roll) -- same axis convention/order, composed as quaternions."""
+    qy = quat_from_axis_angle((0.0, 1.0, 0.0), yaw)
+    qx = quat_from_axis_angle((1.0, 0.0, 0.0), pitch)
+    qz = quat_from_axis_angle((0.0, 0.0, 1.0), roll)
+    return quat_normalize(quat_multiply(quat_multiply(qy, qx), qz))
+
+
+def quat_to_matrix(q):
+    """3x3 rotation matrix for a unit quaternion, equal to camera_matrix's
+    output when q == quat_from_euler(yaw, pitch, roll)."""
+    w, x, y, z = quat_normalize(q)
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    return np.array([
+        [1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)],
+        [2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)],
+        [2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)],
+    ], dtype=float)
+
+
+def euler_from_quat(q):
+    """Inverse of quat_from_euler -- (yaw, pitch, roll) radians, purely for
+    display/scene-file readability.
+
+    Handles the gimbal-lock pose (pitch = +-90deg) explicitly. The usual
+    formulas read yaw from R[0,2]/R[2,2] and roll from R[1,0]/R[1,1], but
+    every one of those four elements carries a cos(pitch) factor, so at
+    pitch = +-90 they are all zero and atan2(0, 0) silently returns 0 --
+    which would report yaw = roll = 0 for a camera that is in fact
+    rotated, and recompose to the WRONG rotation. Real --camera-data
+    recordings do hit this exactly ('Map_Race_#01.txt' does, at t ~= 7.4s),
+    so it is not a theoretical edge case. There, yaw and roll are not
+    separately determined -- only (yaw - roll) at pitch = +90 and
+    (yaw + roll) at pitch = -90 are -- so roll is pinned to 0 and the
+    whole rotation is folded into yaw, which round-trips exactly through
+    quat_from_euler."""
+    R = quat_to_matrix(q)
+    sin_pitch = max(-1.0, min(1.0, -R[1, 2]))
+    pitch = math.asin(sin_pitch)
+    if abs(sin_pitch) > 1.0 - 1e-9:
+        # Gimbal lock: fold yaw and roll together into yaw, roll = 0.
+        if sin_pitch > 0.0:   # pitch = +90: R[0,0]=cos(yaw-roll), R[0,1]=sin(yaw-roll)
+            yaw = math.atan2(R[0, 1], R[0, 0])
+        else:                 # pitch = -90: R[0,0]=cos(yaw+roll), R[0,1]=-sin(yaw+roll)
+            yaw = math.atan2(-R[0, 1], R[0, 0])
+        return yaw, pitch, 0.0
+    yaw = math.atan2(R[0, 2], R[2, 2])
+    roll = math.atan2(R[1, 0], R[1, 1])
+    return yaw, pitch, roll
+
+
+def quat_slerp(q0, q1, t):
+    """Spherical linear interpolation, shortest arc. This is what lets
+    CameraPath/SensorCameraData interpolate yaw+pitch(+roll) TOGETHER, in
+    one operation, instead of three separately shortest-angle-unwrapped
+    Euler lerps."""
+    q0 = quat_normalize(q0)
+    q1 = quat_normalize(q1)
+    dot = float(np.dot(q0, q1))
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+    if dot > 0.9995:
+        return quat_normalize(q0 + (q1 - q0) * t)
+    theta0 = math.acos(max(-1.0, min(1.0, dot)))
+    sin_theta0 = math.sin(theta0)
+    theta = theta0 * t
+    s0 = math.cos(theta) - dot * math.sin(theta) / sin_theta0
+    s1 = math.sin(theta) / sin_theta0
+    return quat_normalize(q0 * s0 + q1 * s1)
+
+
+def _quat_spring_step(quat, ang_vel, target_quat, k, c, dt):
+    """One semi-implicit-Euler step of a rotational spring-damper chasing
+    target_quat, done in quaternion/angular-velocity space (the rotational
+    analogue of the plain position spring in _build_inertia_cache) --
+    used by CameraPath and SensorCameraData's inertia smoothing so camera
+    ROTATION gets real momentum/overshoot too, not just position, without
+    ever falling back to per-axis Euler springs (which would need manual
+    angle-wrap handling and can behave oddly near +-90deg pitch)."""
+    q_target = quat_normalize(target_quat)
+    q_cur = quat_normalize(quat)
+    dq = quat_multiply(q_target, quat_conjugate(q_cur))
+    if dq[0] < 0.0:
+        dq = -dq  # shortest arc
+    w, x, y, z = dq
+    sin_half = math.sqrt(max(0.0, x * x + y * y + z * z))
+    half_angle = math.atan2(sin_half, w)
+    axis = (np.array([x, y, z], dtype=np.float64) / sin_half
+            if sin_half > 1e-9 else np.zeros(3, dtype=np.float64))
+    error_vec = axis * (2.0 * half_angle)  # world-space axis-angle error, radians
+
+    ang_acc = k * error_vec - c * ang_vel
+    ang_vel = ang_vel + ang_acc * dt
+    delta = ang_vel * dt
+    delta_mag = float(np.linalg.norm(delta))
+    dq_step = (quat_from_axis_angle(delta / delta_mag, delta_mag)
+               if delta_mag > 1e-12 else quat_identity())
+    q_new = quat_normalize(quat_multiply(dq_step, q_cur))
+    return q_new, ang_vel
+
+
 def camera_matrix(yaw, pitch, roll=0.0):
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    cp, sp = math.cos(pitch), math.sin(pitch)
-    Ry = np.array([[cy, 0, sy],
-                   [0, 1, 0],
-                   [-sy, 0, cy]], dtype=float)
-    Rx = np.array([[1, 0, 0],
-                   [0, cp, -sp],
-                   [0, sp, cp]], dtype=float)
-    if roll == 0.0:
-        return Ry @ Rx
-    cr, sr = math.cos(roll), math.sin(roll)
-    Rz = np.array([[cr, -sr, 0],
-                   [sr, cr, 0],
-                   [0, 0, 1]], dtype=float)
-    return Ry @ Rx @ Rz
+    """R = Ry(yaw) * Rx(pitch) * Rz(roll). Built via quat_from_euler /
+    quat_to_matrix -- quaternions are the canonical rotation
+    representation in the core logic (see the block comment above); this
+    function stays as the plain-float entry point every HUD/menu/keyframe
+    call site already uses, and always agrees with anything computed
+    straight from a quaternion since they share the same math underneath."""
+    return quat_to_matrix(quat_from_euler(yaw, pitch, roll))
 
 
 def dir_from_yaw_pitch(yaw, pitch):
@@ -285,15 +525,9 @@ def yaw_pitch_from_dir(d):
 
 def rotation_matrix(yaw, pitch, roll):
     """R = Ry(yaw) * Rx(pitch) * Rz(roll) -- used to rotate an OBJECT
-    (box/image) around its own center; independent of camera_matrix but
-    shares the same axis convention."""
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    cp, sp = math.cos(pitch), math.sin(pitch)
-    cr, sr = math.cos(roll), math.sin(roll)
-    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], dtype=float)
-    Rx = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]], dtype=float)
-    Rz = np.array([[cr, -sr, 0], [sr, cr, 0], [0, 0, 1]], dtype=float)
-    return Ry @ Rx @ Rz
+    (box/image) around its own center; shares camera_matrix's axis
+    convention and, like it, is built via a quaternion under the hood."""
+    return quat_to_matrix(quat_from_euler(yaw, pitch, roll))
 
 
 def normalize(v):
@@ -833,6 +1067,14 @@ class Background:
         self.sky = None                # gradient params dict, if set_sky_gradient was called
         self.sun = None                # sun/moon disc params dict, if set_sun was called
         self.stars = None              # star-field params dict, if set_stars was called
+        # Visibility toggles, independent of whether the sun/star params
+        # exist at all: turning either OFF keeps its full configuration
+        # (angle, color, density, seed, ...) so it can be turned back on
+        # unchanged, rather than having to be re-described from scratch.
+        # _repaint simply skips a disabled layer. See set_sun_enabled /
+        # set_stars_enabled and RayTracer.toggle_sun / toggle_stars.
+        self.sun_enabled = True
+        self.stars_enabled = True
         self._sky_base_image = None    # the plain gradient, no sun/stars -- see _repaint
         self._star_field = None        # list of (u, v, size, base_color, phase) -- see set_stars
         if image_path and os.path.exists(image_path):
@@ -992,7 +1234,8 @@ class Background:
         color/brightness" instead of a perfectly static field. No effect
         if set_stars hasn't been called (or twinkle=0 -- nothing would
         change anyway)."""
-        if self.stars is None or self._star_field is None or self.stars['twinkle'] <= 1e-4:
+        if (self.stars is None or self._star_field is None or not self.stars_enabled
+                or self.stars['twinkle'] <= 1e-4):
             return
         self._repaint(star_time=t)
 
@@ -1031,7 +1274,7 @@ class Background:
         """Paints self._star_field onto self.image (assumes the caller,
         _repaint, has already reset self.image to the clean base+sun).
         `star_time` drives each star's twinkle sine -- see update_stars."""
-        if not self._star_field:
+        if not self._star_field or not self.stars_enabled:
             return
         h, w = self.img_h, self.img_w
         twinkle = self.stars['twinkle']
@@ -1062,11 +1305,33 @@ class Background:
                     # sky itself is dark enough.
                     self.image[iy, ix] = np.maximum(self.image[iy, ix], col * t)
 
+    def set_sun_enabled(self, enabled):
+        """Shows/hides the sun/moon disc WITHOUT discarding its settings
+        (contrast with set_sun(intensity=0), which overwrites the stored
+        intensity and so can't be undone by a plain toggle). No-op if
+        nothing would change."""
+        enabled = bool(enabled)
+        if enabled == self.sun_enabled:
+            return self
+        self.sun_enabled = enabled
+        self._repaint()
+        return self
+
+    def set_stars_enabled(self, enabled):
+        """Shows/hides the star field without discarding its settings --
+        see set_sun_enabled."""
+        enabled = bool(enabled)
+        if enabled == self.stars_enabled:
+            return self
+        self.stars_enabled = enabled
+        self._repaint()
+        return self
+
     def _paint_sun(self):
         """Paints the current self.sun disc onto self.image (assumes the
         caller, _repaint, has already reset self.image to the clean
         base)."""
-        if self._sky_base_image is None or self.sun is None:
+        if self._sky_base_image is None or self.sun is None or not self.sun_enabled:
             return
         s = self.sun
         if s['intensity'] <= 1e-4:
@@ -1129,6 +1394,11 @@ class Background:
             d['sun'] = dict(self.sun)
         if self.stars is not None:
             d['stars'] = dict(self.stars)
+        # Always written (not just when a sun/star field exists) so a
+        # round-trip is exact even for a scene that has one configured but
+        # currently hidden.
+        d['sun_enabled'] = bool(self.sun_enabled)
+        d['stars_enabled'] = bool(self.stars_enabled)
         return d
 
     @staticmethod
@@ -1163,6 +1433,11 @@ class Background:
                         twinkle=float(stars.get('twinkle', 0.15)),
                         above_horizon_only=bool(stars.get('above_horizon_only', True)),
                         seed=int(stars.get('seed', 0)))
+        # Default True so scenes written by older versions (which had no
+        # concept of hiding either layer) load looking exactly as before.
+        bg.sun_enabled = bool(d.get('sun_enabled', True))
+        bg.stars_enabled = bool(d.get('stars_enabled', True))
+        bg._repaint()
         return bg
 
 
@@ -2888,8 +3163,14 @@ class CameraPath:
                 local_t = (t_clamped - acc) / d if d > 1e-9 else 1.0
                 local_t = max(0.0, min(1.0, local_t))
                 pos = a.pos + (b.pos - a.pos) * local_t
-                yaw = a.yaw + _shortest_angle_diff(a.yaw, b.yaw) * local_t
-                pitch = a.pitch + (b.pitch - a.pitch) * local_t
+                # Orientation is interpolated as a single quaternion slerp
+                # (roll is always 0 for hand-placed keyframes) rather than
+                # yaw/pitch lerped independently -- see the quaternion
+                # utilities near camera_matrix for why this is the
+                # canonical way to blend camera orientation.
+                qa = quat_from_euler(a.yaw, a.pitch, 0.0)
+                qb = quat_from_euler(b.yaw, b.pitch, 0.0)
+                yaw, pitch, _roll = euler_from_quat(quat_slerp(qa, qb, local_t))
                 phase_acc += (local_t * seg_len) / seg_stride if seg_stride > 1e-6 else 0.0
                 return pos, float(yaw), float(pitch), phase_acc, seg_speed
             phase_acc += seg_len / seg_stride if seg_stride > 1e-6 else 0.0
@@ -3007,11 +3288,14 @@ class CameraPath:
 
         raw0 = self._raw_pose_at(max(0.0, t0))
         pos = raw0[0].astype(np.float64).copy()
-        yaw = float(raw0[1])
-        pitch = float(raw0[2])
+        # Rotation is smoothed as a QUATERNION spring (see
+        # _quat_spring_step), not independent yaw/pitch springs -- this is
+        # the rotational analogue of the position spring just below, and
+        # keeps the smoothing gimbal-lock-free and consistent with how
+        # CameraPath/SensorCameraData interpolate everywhere else.
+        quat = quat_from_euler(float(raw0[1]), float(raw0[2]), 0.0)
         vel_pos = np.zeros(3, dtype=np.float64)
-        vel_yaw = 0.0
-        vel_pitch = 0.0
+        ang_vel = np.zeros(3, dtype=np.float64)
 
         grid_pos = np.empty((n_steps, 3), dtype=np.float32)
         grid_yaw = np.empty(n_steps, dtype=np.float32)
@@ -3021,7 +3305,6 @@ class CameraPath:
 
         k = omega_n * omega_n
         c = 2.0 * zeta * omega_n
-        prev_target_yaw = yaw
         # Footstep phase/speed are re-derived from the SPRING's own smoothed
         # velocity here (see below), not the raw path's declared per-segment
         # speed -- see the note on grid_phase/grid_speed just after the loop
@@ -3033,24 +3316,14 @@ class CameraPath:
             t_query = max(0.0, min(total, t))
             r_pos, r_yaw, r_pitch, _raw_phase, _raw_speed = self._raw_pose_at(t_query)
             r_pos = r_pos.astype(np.float64)
-            # Unwrap the raw target's yaw against the PREVIOUS target (not
-            # against the spring's own yaw) so a raw path that itself
-            # wraps through +-pi doesn't confuse the spring into thinking
-            # it needs to swing all the way around.
-            r_yaw = prev_target_yaw + _shortest_angle_diff(prev_target_yaw, r_yaw)
-            prev_target_yaw = r_yaw
+            r_quat = quat_from_euler(float(r_yaw), float(r_pitch), 0.0)
 
             acc_pos = k * (r_pos - pos) - c * vel_pos
             vel_pos = vel_pos + acc_pos * sim_dt
             pos = pos + vel_pos * sim_dt
 
-            acc_yaw = k * (r_yaw - yaw) - c * vel_yaw
-            vel_yaw = vel_yaw + acc_yaw * sim_dt
-            yaw = yaw + vel_yaw * sim_dt
-
-            acc_pitch = k * (r_pitch - pitch) - c * vel_pitch
-            vel_pitch = vel_pitch + acc_pitch * sim_dt
-            pitch = pitch + vel_pitch * sim_dt
+            quat, ang_vel = _quat_spring_step(quat, ang_vel, r_quat, k, c, sim_dt)
+            yaw, pitch, _roll = euler_from_quat(quat)
 
             # Speed actually being displayed right now (the spring's own
             # velocity), not the target segment's nominal speed -- these
@@ -3304,6 +3577,19 @@ class CameraPath:
         return (pos + pos_off + gpos, yaw + yaw_off + gyaw,
                 pitch + pitch_off + gpitch, roll_off + groll)
 
+    def sample_quat(self, t):
+        """Same pose as sample(), but returning (pos, quaternion) instead
+        of (pos, yaw, pitch, roll) -- the gimbal-lock-free form callers
+        should prefer (see the note on SensorCameraData.sample_quat, which
+        is where it actually matters; a hand-placed keyframe path can't
+        reach pitch=+-90deg, so for CameraPath the two agree exactly).
+        Returns None for an empty path."""
+        s = self.sample(t)
+        if s is None:
+            return None
+        pos, yaw, pitch, roll = s
+        return pos, quat_from_euler(yaw, pitch, roll)
+
     def to_list(self):
         return [kf.to_dict() for kf in self.keyframes]
 
@@ -3328,26 +3614,70 @@ class CameraPath:
 # =============================================================================
 
 class _SensorSample:
-    __slots__ = ("t", "pos", "yaw", "pitch", "roll")
+    __slots__ = ("t", "pos", "yaw", "pitch", "roll", "quat")
 
-    def __init__(self, t, pos, yaw, pitch, roll):
+    def __init__(self, t, pos, yaw, pitch, roll, quat=None):
         self.t = float(t)
         self.pos = pos  # np.float32[3]
+        # yaw/pitch/roll are kept purely for display/readability (HUD,
+        # "camera data" status line, camera_dict-style introspection);
+        # `quat` is canonical and is what sample()/interpolation actually
+        # uses -- see the quaternion utilities near camera_matrix. If not
+        # given explicitly (e.g. by a loader that only has Euler angles),
+        # it's derived from yaw/pitch/roll once here.
         self.yaw = float(yaw)
         self.pitch = float(pitch)
         self.roll = float(roll)
+        self.quat = quat_normalize(quat) if quat is not None else quat_from_euler(yaw, pitch, roll)
+
+
+def _parse_locale_float(s):
+    """Parses a float that may use ',' as the decimal separator (as seen
+    in plain-text --camera-data exports like Map_Race_#01.txt) as well as
+    the normal '.' separator. There is no thousands-grouping in these
+    files -- fields are already split on ':' -- so a bare ',' is always a
+    decimal point here."""
+    s = s.strip()
+    return float(s.replace(',', '.')) if s else 0.0
 
 
 class SensorCameraData:
-    """Loaded from a sensor_record JSON (version 1: timestamp_unit "ms",
-    position_unit "m", rotation_unit "deg", samples: [{timestamp, pos:{x,y,z},
-    rot:{x,y,z}}, ...]). rot.x/.y/.z map to pitch/yaw/roll respectively (same
-    axis convention as camera_matrix's Rx=pitch, Ry=yaw, Rz=roll)."""
+    """Camera path loaded from an external recording, driving the camera
+    instead of hand-placed keyframes (--camera-data). Two file formats are
+    understood (auto-detected by SensorCameraData.load):
+
+    1) A sensor_record JSON (version 1: timestamp_unit "ms", position_unit
+       "m", rotation_unit "deg", samples: [{timestamp, pos:{x,y,z},
+       rot:{x,y,z}}, ...]). rot.x/.y/.z map to pitch/yaw/roll respectively
+       (same axis convention as camera_matrix's Rx=pitch, Ry=yaw, Rz=roll).
+
+    2) A plain-text quaternion track (e.g. 'Map_Race_#01.txt'): one sample
+       per line, ':'-separated, `t:pos_x:pos_y:pos_z:qx:qy:qz:qw` (decimal
+       comma or dot; an optional trailing 'END:<n>' line is ignored).
+       Orientation here is ALREADY a quaternion -- no Euler conversion
+       needed on the way in, which is exactly the canonical representation
+       this class (and the rest of the core camera logic) uses internally.
+
+    Orientation is stored and INTERPOLATED as a quaternion (see
+    _SensorSample.quat / sample()'s use of quat_slerp) -- yaw/pitch/roll
+    are only ever recovered from it for display."""
 
     def __init__(self, samples, multiplier=1.0, offset=(0.0, 0.0, 0.0)):
         self.samples = samples  # list[_SensorSample], t sorted ascending, t[0] == 0.0
         self.multiplier = float(multiplier)
         self.offset = np.array(offset, dtype=np.float32)
+        # --- Inertia smoothing (see CameraPath.inertia's docstring) ------
+        # Off (0.0) by default, matching CameraPath -- set from
+        # --inertia/--inertia-bounce in main() after loading, same as it
+        # is for keyframe paths. Uses the SAME spring math (position
+        # spring + _quat_spring_step for rotation) and the same
+        # precompute-a-dense-grid-up-front approach as
+        # CameraPath._build_inertia_cache, for the same determinism
+        # reasons (motion-blur sub-sampling / multi-GPU time blocks must
+        # all agree on the smoothed trajectory regardless of call order).
+        self.inertia = 0.0
+        self.inertia_bounce = 0.35
+        self._inertia_cache = None
 
     def is_camera_data(self):
         return True
@@ -3361,7 +3691,66 @@ class SensorCameraData:
         return 1.0
 
     @staticmethod
-    def load(path, multiplier=1.0, offset=(0.0, 0.0, 0.0)):
+    def load(path, multiplier=1.0, offset=(0.0, 0.0, 0.0), rot_offset_quat=None):
+        """Loads either file format (see the class docstring), auto-
+        detected: a '.json' extension (or content starting with '{') is
+        parsed as the sensor_record JSON; anything else (e.g. '.txt', like
+        'Map_Race_#01.txt') is parsed as the plain-text quaternion track.
+        `rot_offset_quat`, if given, is applied (pre-multiplied) as an
+        orientation offset on every sample -- see --camera-rot-offset /
+        the rotation half of --camera-offset."""
+        is_json = path.lower().endswith('.json')
+        if not is_json:
+            with open(path, 'r', encoding='utf-8') as f:
+                head = f.read(256).lstrip()
+            is_json = head.startswith('{')
+        rot_decimals = None
+        if is_json:
+            samples = SensorCameraData._load_json_samples(path, multiplier, offset, rot_offset_quat)
+        else:
+            samples, rot_decimals = SensorCameraData._load_txt_samples(
+                path, multiplier, offset, rot_offset_quat)
+        if not samples:
+            raise ValueError(f"'{path}' has no samples.")
+        samples.sort(key=lambda s: s.t)
+        data = SensorCameraData(samples, multiplier=multiplier, offset=offset)
+        data.source_path = path
+        data.rot_decimals = rot_decimals
+        # A text track stores each quaternion component as a rounded
+        # decimal. At 1 or 2 decimals that rounding is worth flagging: an
+        # error of +-0.05 on a unit quaternion component is up to ~5.7deg
+        # of orientation, so individual samples can be several degrees
+        # off and the replay picks up a visible snap/twitch wherever the
+        # rounding happens to move a component a whole step. This is a
+        # property of the FILE, not of the interpolation -- slerp
+        # reproduces faithfully whatever it is given. --inertia smooths it.
+        if rot_decimals is not None and rot_decimals <= 2:
+            worst_deg, worst_t = data.worst_rotation_step()
+            print(f"Note: '{path}' stores rotation to {rot_decimals} decimal place"
+                  f"{'' if rot_decimals == 1 else 's'} (~"
+                  f"{math.degrees(2 * math.asin(min(1.0, 0.5 * 10 ** -rot_decimals))):.1f}deg of "
+                  f"orientation resolution). Largest single-sample rotation step is "
+                  f"{worst_deg:.1f}deg at t={worst_t:.2f}s; if that reads as a snap/flip, it is the "
+                  f"recording's precision, not the replay -- try --inertia 0.3 (or higher) to "
+                  f"smooth it.")
+        return data
+
+    def worst_rotation_step(self):
+        """(largest rotation angle in degrees between two CONSECUTIVE
+        recorded samples, the timestamp it happens at) -- a quick measure
+        of how jumpy a recording is, used for the precision note in
+        load(). Quaternion geometry, so it is meaningful even where a
+        yaw/pitch/roll view of the same motion would be degenerate."""
+        worst, worst_t = 0.0, 0.0
+        for a, b in zip(self.samples, self.samples[1:]):
+            dot = abs(float(np.dot(quat_normalize(a.quat), quat_normalize(b.quat))))
+            ang = math.degrees(2.0 * math.acos(max(-1.0, min(1.0, dot))))
+            if ang > worst:
+                worst, worst_t = ang, b.t
+        return worst, worst_t
+
+    @staticmethod
+    def _load_json_samples(path, multiplier, offset, rot_offset_quat):
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         raw_samples = data.get('samples', [])
@@ -3382,9 +3771,53 @@ class SensorCameraData:
             pitch = math.radians(r['z'])
             yaw = math.radians(r['y'])
             roll = math.radians(r['x'])
-            samples.append(_SensorSample(t, pos, yaw, pitch, roll))
-        samples.sort(key=lambda s: s.t)
-        return SensorCameraData(samples, multiplier=multiplier, offset=offset)
+            q = quat_from_euler(yaw, pitch, roll)
+            if rot_offset_quat is not None:
+                q = quat_normalize(quat_multiply(rot_offset_quat, q))
+            yaw, pitch, roll = euler_from_quat(q)
+            samples.append(_SensorSample(t, pos, yaw, pitch, roll, quat=q))
+        return samples
+
+    @staticmethod
+    def _load_txt_samples(path, multiplier, offset, rot_offset_quat):
+        """`t:pos_x:pos_y:pos_z:qx:qy:qz:qw` per line -- see class
+        docstring. Blank lines and a trailing 'END:<n>' marker are
+        skipped. Quaternion component order is assumed x,y,z,w (the
+        common convention for this kind of exported track); each is
+        re-normalized on load since text exports round each component to
+        a fixed number of decimals, which drifts the norm slightly."""
+        offset_arr = np.array(offset, dtype=np.float32)
+        samples = []
+        # Tracked so load() can warn about a coarsely-quantized recording
+        # -- see the note there. Purely diagnostic; nothing is altered.
+        max_rot_decimals = 0
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.upper().startswith('END'):
+                    continue
+                parts = line.split(':')
+                if len(parts) < 8:
+                    continue
+                t = _parse_locale_float(parts[0])
+                px, py, pz = (_parse_locale_float(parts[i]) for i in (1, 2, 3))
+                qx, qy, qz, qw = (_parse_locale_float(parts[i]) for i in (4, 5, 6, 7))
+                pos = (np.array([px, py, pz], dtype=np.float32) * multiplier) + offset_arr
+                for raw in parts[4:8]:
+                    raw = raw.strip()
+                    dec = len(raw.split(',')[1]) if ',' in raw else (
+                        len(raw.split('.')[1]) if '.' in raw else 0)
+                    max_rot_decimals = max(max_rot_decimals, dec)
+                q = quat_normalize(np.array([qw, qx, qy, qz], dtype=np.float64))
+                if rot_offset_quat is not None:
+                    q = quat_normalize(quat_multiply(rot_offset_quat, q))
+                yaw, pitch, roll = euler_from_quat(q)
+                samples.append(_SensorSample(t, pos, yaw, pitch, roll, quat=q))
+        if samples:
+            t0 = samples[0].t
+            for s in samples:
+                s.t -= t0
+        return samples, max_rot_decimals
 
     def total_duration(self):
         return self.samples[-1].t if self.samples else 0.0
@@ -3401,17 +3834,27 @@ class SensorCameraData:
             return 0.0
         return (len(self.samples) - 1) / total
 
-    def sample(self, t):
-        """t (seconds from the first sample) -> (pos np.float32[3], yaw, pitch, roll),
-        LINEARLY interpolated between the two nearest samples (roll uses the
-        shortest-angle interpolation too, same as yaw, so it doesn't spin the
-        long way around at the +-180deg wrap)."""
+    def _raw_sample_quat(self, t):
+        """t (seconds from the first sample) -> (pos np.float32[3], unit
+        quaternion), WITHOUT inertia smoothing -- LINEAR position
+        interpolation and quaternion SLERP orientation interpolation
+        between the two nearest samples.
+
+        This, not _raw_sample, is the primitive: orientation never touches
+        Euler angles on this path at all. That matters because a real
+        recording CAN pass exactly through pitch = +-90deg, where the
+        yaw/pitch/roll decomposition is singular (yaw and roll stop being
+        separately determined) -- 'Map_Race_#01.txt' does exactly that at
+        t ~= 7.4s, where the raw quaternion is a perfectly well-behaved
+        (0.5, 0.5, -0.5, 0.5). Decomposing there and recomposing
+        afterwards throws the orientation away and snaps the camera; the
+        quaternion itself is continuous straight through it."""
         n = len(self.samples)
         if n == 0:
             return None
         if n == 1:
             s = self.samples[0]
-            return s.pos.copy(), s.yaw, s.pitch, s.roll
+            return s.pos.copy(), s.quat.copy()
 
         t = max(0.0, min(t, self.samples[-1].t))
         # Binary search for the segment containing t.
@@ -3427,9 +3870,125 @@ class SensorCameraData:
         local_t = (t - a.t) / span if span > 1e-9 else 1.0
         local_t = max(0.0, min(1.0, local_t))
         pos = a.pos + (b.pos - a.pos) * local_t
-        yaw = a.yaw + _shortest_angle_diff(a.yaw, b.yaw) * local_t
-        pitch = a.pitch + (b.pitch - a.pitch) * local_t
-        roll = a.roll + _shortest_angle_diff(a.roll, b.roll) * local_t
+        return pos, quat_slerp(a.quat, b.quat, local_t)
+
+    def _raw_sample(self, t):
+        """Euler view of _raw_sample_quat -- (pos, yaw, pitch, roll). Only
+        for display/back-compat callers; anything that feeds the renderer
+        should use sample_quat so it doesn't lose orientation at a
+        gimbal-lock pose (see _raw_sample_quat)."""
+        s = self._raw_sample_quat(t)
+        if s is None:
+            return None
+        pos, q = s
+        yaw, pitch, roll = euler_from_quat(q)
+        return pos, float(yaw), float(pitch), float(roll)
+
+    def _inertia_signature(self):
+        return (id(self.samples), len(self.samples), self.total_duration(),
+                self.inertia, self.inertia_bounce)
+
+    def _build_inertia_cache(self):
+        """Same approach as CameraPath._build_inertia_cache (see its
+        docstring for the full rationale: fixed-grid precompute for
+        determinism under motion-blur sub-sampling / multi-GPU time
+        blocks) -- position spring + quaternion rotational spring
+        (_quat_spring_step) chasing the raw recorded trajectory. The grid
+        stores QUATERNIONS, not Euler angles, so neither the simulation
+        nor the later lookup can be corrupted by a gimbal-lock pose
+        anywhere along the recording."""
+        n = len(self.samples)
+        if n < 2 or self.inertia <= 1e-6:
+            self._inertia_cache = None
+            return
+        total = self.total_duration()
+        if total <= 1e-6:
+            self._inertia_cache = None
+            return
+        sim_hz = 240.0
+        sim_dt = 1.0 / sim_hz
+        pre_roll = 1.5
+        post_roll = 1.5
+        t0 = -pre_roll
+        t1 = total + post_roll
+        n_steps = max(2, int(math.ceil((t1 - t0) / sim_dt)) + 1)
+
+        time_constant = 0.08 + 0.6 * min(self.inertia, 3.0)
+        omega_n = 1.0 / max(1e-3, time_constant)
+        zeta = max(0.05, 1.0 - max(0.0, min(1.0, self.inertia_bounce)) * 0.85)
+        k = omega_n * omega_n
+        c = 2.0 * zeta * omega_n
+
+        r0_pos, r0_quat = self._raw_sample_quat(max(0.0, t0))
+        pos = r0_pos.astype(np.float64).copy()
+        quat = r0_quat.copy()
+        vel_pos = np.zeros(3, dtype=np.float64)
+        ang_vel = np.zeros(3, dtype=np.float64)
+
+        grid_pos = np.empty((n_steps, 3), dtype=np.float32)
+        grid_quat = np.empty((n_steps, 4), dtype=np.float64)
+
+        for i in range(n_steps):
+            t = t0 + i * sim_dt
+            t_query = max(0.0, min(total, t))
+            r_pos, r_quat = self._raw_sample_quat(t_query)
+            r_pos = r_pos.astype(np.float64)
+
+            acc_pos = k * (r_pos - pos) - c * vel_pos
+            vel_pos = vel_pos + acc_pos * sim_dt
+            pos = pos + vel_pos * sim_dt
+
+            quat, ang_vel = _quat_spring_step(quat, ang_vel, r_quat, k, c, sim_dt)
+
+            grid_pos[i] = pos
+            grid_quat[i] = quat
+
+        # Hemisphere-align consecutive grid quaternions so the slerp done
+        # at lookup time below always takes the short way round (q and -q
+        # are the same rotation, but lerping between them is not).
+        for i in range(1, n_steps):
+            if float(np.dot(grid_quat[i - 1], grid_quat[i])) < 0.0:
+                grid_quat[i] = -grid_quat[i]
+
+        self._inertia_cache = {
+            'sig': self._inertia_signature(),
+            't0': t0, 'dt': sim_dt, 'n': n_steps,
+            'pos': grid_pos, 'quat': grid_quat,
+        }
+
+    def sample_quat(self, t):
+        """(pos, quaternion) at time t, with inertia smoothing applied
+        when self.inertia > 0. This is the form the renderer should use --
+        it is exactly what the recording says, with no Euler decomposition
+        anywhere in the chain, so a recording that passes through
+        pitch = +-90deg replays correctly instead of snapping (see
+        _raw_sample_quat)."""
+        if len(self.samples) < 2 or self.inertia <= 1e-6:
+            return self._raw_sample_quat(t)
+        if self._inertia_cache is None or self._inertia_cache['sig'] != self._inertia_signature():
+            self._build_inertia_cache()
+        cache = self._inertia_cache
+        if cache is None:
+            return self._raw_sample_quat(t)
+        t0, dt, n = cache['t0'], cache['dt'], cache['n']
+        f = (t - t0) / dt
+        i0 = max(0, min(n - 1, int(math.floor(f))))
+        i1 = max(0, min(n - 1, i0 + 1))
+        local = max(0.0, min(1.0, f - i0))
+        pos = cache['pos'][i0] + (cache['pos'][i1] - cache['pos'][i0]) * local
+        quat = quat_slerp(cache['quat'][i0], cache['quat'][i1], local)
+        return pos.astype(np.float32), quat
+
+    def sample(self, t):
+        """Euler view of sample_quat -- (pos, yaw, pitch, roll), for
+        display and for back-compatibility with callers written against
+        the old signature. Prefer sample_quat anywhere the result drives
+        the camera."""
+        s = self.sample_quat(t)
+        if s is None:
+            return None
+        pos, q = s
+        yaw, pitch, roll = euler_from_quat(q)
         return pos, float(yaw), float(pitch), float(roll)
 
 
@@ -3517,23 +4076,34 @@ class LiveCameraStream:
     def total_duration(self):
         return 0.0  # open-ended stream -- there's no fixed "length" to report
 
-    def sample(self, t=None):
-        """t is accepted (for interface-compatibility with CameraPath/
-        SensorCameraData) but ignored: a live stream has no timeline to seek,
-        only a "most recent pose". Returns None until at least one packet
-        has arrived."""
+    def sample_quat(self, t=None):
+        """(pos, quaternion) for the most recent pose -- the form the
+        renderer should use. Like SensorCameraData.sample_quat, the blend
+        between the last two packets is a quaternion SLERP rather than
+        per-axis angle lerps, so a stream that passes through
+        pitch = +-90deg doesn't snap there. Returns None until at least
+        one packet has arrived."""
         self._drain()
         if self._latest is None:
             return None
         if self._prev is None or self.smoothing <= 0.0:
             s = self._latest
-            return s.pos.copy(), s.yaw, s.pitch, s.roll
+            return s.pos.copy(), s.quat.copy()
         a, b = self._prev, self._latest
         blend = 1.0 - self.smoothing
         pos = a.pos * (1.0 - blend) + b.pos * blend
-        yaw = a.yaw + _shortest_angle_diff(a.yaw, b.yaw) * blend
-        pitch = a.pitch + (b.pitch - a.pitch) * blend
-        roll = a.roll + _shortest_angle_diff(a.roll, b.roll) * blend
+        return pos, quat_slerp(a.quat, b.quat, blend)
+
+    def sample(self, t=None):
+        """Euler view of sample_quat -- (pos, yaw, pitch, roll), kept for
+        interface-compatibility with the old signature. t is accepted (to
+        match CameraPath/SensorCameraData) but ignored: a live stream has
+        no timeline to seek, only a "most recent pose"."""
+        s = self.sample_quat(t)
+        if s is None:
+            return None
+        pos, q = s
+        yaw, pitch, roll = euler_from_quat(q)
         return pos, float(yaw), float(pitch), float(roll)
 
 
@@ -3597,9 +4167,12 @@ class RayTracer:
         self.background = background if background is not None else Background()
 
         self.camera_pos = np.array([0.0, 5.0, -25.0], dtype=np.float32)
-        self.camera_rot = np.array([0.0, 0.0], dtype=np.float32)
-        self.camera_roll = 0.0  # radians -- only nonzero via --camera-data sensor replay
-                                 # or the interactive ,/./ roll keys (see camera_matrix)
+        # Canonical orientation storage -- see camera_quat/camera_rot/
+        # camera_roll properties below. camera_rot/camera_roll (yaw/pitch,
+        # roll) are still fully readable/writable exactly as before; they
+        # just now go through this quaternion instead of being the
+        # storage themselves.
+        self._camera_quat = quat_identity()
         self.water_time = 0.0   # seconds -- 0.0 = water ripples stay still (still image/live
                                  # raytrace, same as before); render_video() updates this value
                                  # EVERY frame (or every sub-sample when motion blur is on) so
@@ -3624,6 +4197,7 @@ class RayTracer:
         self.lights = list(lights) if lights else [Light((15, 30, -15), (255, 255, 255), 1.0)]
         if len(self.lights) > MAX_LIGHTS:
             raise ValueError(f"Max {MAX_LIGHTS} lights, got {len(self.lights)}")
+        self.sun_light = None  # set by add_sun_light/add_sun -- lets set_sun_angle move it later
 
         self.spotlights = list(spotlights) if spotlights else []
         if len(self.spotlights) > MAX_SPOTLIGHTS:
@@ -3646,6 +4220,11 @@ class RayTracer:
         self.compute_caustics()
 
         self.clouds = None  # see set_clouds -- disabled by default
+        # How often the interactive live view re-bakes the star field's
+        # twinkle (seconds). 0 disables the update entirely, freezing the
+        # field as baked -- see update_stars / set_star_update_interval.
+        # Previously hard-coded to 1.0 in the interactive loop.
+        self.star_update_interval = 1.0
         alloc_cloud_fields()
         self._sync_cloud_fields()
 
@@ -3744,6 +4323,7 @@ class RayTracer:
         pos = np.array([dx, dy, dz], dtype=np.float64) * float(distance)
         light = Light(pos, color=color, brightness=brightness)
         self.lights.append(light)
+        self.sun_light = light  # so set_sun_angle can find and move it later
         self.sync_lights()
         return light
 
@@ -3793,6 +4373,47 @@ class RayTracer:
             BG_FIELD.from_numpy(self.background.image)
         self.reset_accumulation()
 
+    def set_sun_angle(self, azimuth_deg=None, elevation_deg=None):
+        """Moves the sun/moon to a new azimuth/elevation -- updates the
+        visual disc (Background.set_sun), the self-shadow direction
+        clouds use (if any), AND, if add_sun_light/add_sun created a real
+        light for this sun (tracked as self.sun_light), repositions that
+        light too, at the SAME distance it was originally placed --
+        without this, azimuth/elevation would be three separate things
+        (disc, cloud shadows, actual light) to keep in sync by hand every
+        time the sun moves. Pass just one of azimuth_deg/elevation_deg to
+        leave the other as-is. No effect if no sun has been set."""
+        if self.background.sun is None:
+            return
+        az = float(azimuth_deg) if azimuth_deg is not None else self.background.sun['azimuth_deg']
+        el = float(elevation_deg) if elevation_deg is not None else self.background.sun['elevation_deg']
+        self.background.set_sun(**{**self.background.sun, 'azimuth_deg': az, 'elevation_deg': el})
+        if BG_FIELD is not None:
+            BG_FIELD.from_numpy(self.background.image)
+        if self.clouds is not None:
+            self._sync_cloud_fields()
+        if self.sun_light is not None:
+            distance = float(np.linalg.norm(self.sun_light.position))
+            azr, elr = math.radians(az), math.radians(el)
+            dx, dz = math.sin(azr) * math.cos(elr), math.cos(azr) * math.cos(elr)
+            dy = math.sin(elr)
+            self.sun_light.position = np.array([dx, dy, dz], dtype=np.float64) * distance
+            self.sync_lights()
+        self.reset_accumulation()
+
+    def set_sun_appearance(self, **kwargs):
+        """Updates any of the sun/moon disc's other visual fields (color,
+        angular_size_deg, glow_deg, intensity) in one call and re-uploads
+        the sky texture -- for azimuth_deg/elevation_deg use set_sun_angle
+        instead (those also need to move a real light, if one exists, not
+        just the visual disc). No effect if no sun has been set."""
+        if self.background.sun is None:
+            return
+        self.background.set_sun(**{**self.background.sun, **kwargs})
+        if BG_FIELD is not None:
+            BG_FIELD.from_numpy(self.background.image)
+        self.reset_accumulation()
+
     def add_stars(self, density=0.0025, min_size=0.5, max_size=1.6, brightness=1.0,
                  color_variation=0.25, twinkle=0.15, above_horizon_only=True, seed=0):
         """Convenience: Background.set_stars + re-uploads the sky texture
@@ -3809,6 +4430,59 @@ class RayTracer:
             BG_FIELD.from_numpy(self.background.image)
         self.reset_accumulation()
 
+    def set_sun_enabled(self, enabled):
+        """Shows/hides the sun/moon disc (keeping all its settings -- see
+        Background.set_sun_enabled), re-uploads the sky texture and, if a
+        real sun Light exists (add_sun_light/add_sun), mutes/unmutes that
+        too, so the toggle covers both the visual disc and the light it
+        casts rather than leaving a shadow-casting sun with no visible
+        disc. The light's brightness is remembered while muted."""
+        enabled = bool(enabled)
+        self.background.set_sun_enabled(enabled)
+        if self.sun_light is not None:
+            if enabled:
+                restored = getattr(self, '_sun_light_brightness', None)
+                if restored is not None:
+                    self.sun_light.brightness = restored
+            else:
+                self._sun_light_brightness = float(self.sun_light.brightness)
+                self.sun_light.brightness = 0.0
+            self.sync_lights()
+        if BG_FIELD is not None:
+            BG_FIELD.from_numpy(self.background.image)
+        if self.clouds is not None:
+            self._sync_cloud_fields()
+        self.reset_accumulation()
+
+    def toggle_sun(self):
+        """Flips the sun/moon on/off -- see set_sun_enabled. Returns the
+        new state."""
+        self.set_sun_enabled(not self.background.sun_enabled)
+        return self.background.sun_enabled
+
+    def set_stars_enabled(self, enabled):
+        """Shows/hides the star field (keeping all its settings -- see
+        Background.set_stars_enabled) and re-uploads the sky texture."""
+        self.background.set_stars_enabled(bool(enabled))
+        if BG_FIELD is not None:
+            BG_FIELD.from_numpy(self.background.image)
+        self.reset_accumulation()
+
+    def toggle_stars(self):
+        """Flips the star field on/off -- see set_stars_enabled. Returns
+        the new state."""
+        self.set_stars_enabled(not self.background.stars_enabled)
+        return self.background.stars_enabled
+
+    def set_star_update_interval(self, seconds):
+        """How often the interactive live view advances the star twinkle
+        (seconds). 0 turns the update off entirely -- the field stays
+        exactly as baked, which is also the cheapest option (each update
+        re-bakes and re-uploads the sky texture, and resets live
+        accumulation). Has no effect on offline video renders, which
+        sample the twinkle at each frame's own timestamp instead."""
+        self.star_update_interval = max(0.0, float(seconds))
+
     def update_stars(self, t):
         """Advances the star field's twinkle to time t (seconds) and
         re-uploads the sky texture -- see Background.update_stars. Cheap,
@@ -3817,8 +4491,9 @@ class RayTracer:
         interactive live view throttles its own calls to roughly once a
         second (see the main loop) -- call it yourself at whatever
         cadence suits a script or video render. No effect if no star
-        field has been set."""
-        if self.background.stars is None:
+        field has been set (or if the field is currently hidden -- see
+        set_stars_enabled)."""
+        if self.background.stars is None or not self.background.stars_enabled:
             return
         self.background.update_stars(t)
         if BG_FIELD is not None:
@@ -4053,7 +4728,9 @@ class RayTracer:
         use a lower bounce cap than self.max_bounce for speed -- see
         LIVE_MAX_BOUNCE / item 5 in the module docstring."""
         bounce = self.max_bounce if max_bounce_override is None else max_bounce_override
-        R = camera_matrix(*self.camera_rot, self.camera_roll)
+        # Straight from the canonical quaternion -- camera_rot/camera_roll
+        # would decompose and recompose the same rotation on every call.
+        R = quat_to_matrix(self.camera_quat)
         cp = self.camera_pos
         self.sync_lights()
         WATER_TIME[None] = float(self.water_time)
@@ -4166,7 +4843,7 @@ class RayTracer:
         resolve/post-processing/save logic without duplicating it."""
         color, depth = self.current_image_float()
         if post_fx and post_fx.get('enabled', True):
-            R = camera_matrix(*self.camera_rot, self.camera_roll)
+            R = quat_to_matrix(self.camera_quat)
             flares = compute_flare_list(self, self.camera_pos, R)
             camera_pose = (self.camera_pos, R, self.half_tan, self.aspect)
             color = apply_post_processing(color, depth, flares, post_fx, camera_pose=camera_pose)
@@ -4299,7 +4976,7 @@ class RayTracer:
         # Previous frame's (yaw, pitch, roll), for apply_analog_camera's motion
         # smear -- None on this worker's very first rendered frame (no prior
         # pose to diff against yet, so that frame gets no smear).
-        prev_rot_roll = None
+        prev_pose_q = None
         # Whether `camera_path` has an authored zoom track worth following
         # (>=2 keyframes -- zoom_at() only varies between at least two) --
         # if so each frame's zoom ramp target below tracks the path itself
@@ -4357,10 +5034,13 @@ class RayTracer:
                     for s in range(samples_per_frame):
                         frac = (s + np.random.random()) / samples_per_frame
                         tt = t_lo + (t_hi - t_lo) * frac
-                        pos, yaw, pitch, roll = camera_path.sample(tt)
+                        pos, q = camera_path.sample_quat(tt)
                         self.camera_pos = pos.astype(np.float32)
-                        self.camera_rot = np.array([yaw, pitch], dtype=np.float32)
-                        self.camera_roll = roll
+                        # Quaternion straight in -- no Euler decomposition
+                        # in the chain, so a recording that passes through
+                        # pitch = +-90deg replays correctly (see
+                        # SensorCameraData._raw_sample_quat).
+                        self.camera_quat = q
                         self.water_time = tt * WATER_WAVE_SPEED
                         # Sample spotlight animations at this exact
                         # sub-frame shutter time too, so an animated
@@ -4369,10 +5049,9 @@ class RayTracer:
                         self.set_spotlight_animation_time(tt)
                         self.add_samples(1)
                 else:
-                    pos, yaw, pitch, roll = camera_path.sample(t_center)
+                    pos, q = camera_path.sample_quat(t_center)
                     self.camera_pos = pos.astype(np.float32)
-                    self.camera_rot = np.array([yaw, pitch], dtype=np.float32)
-                    self.camera_roll = roll
+                    self.camera_quat = q
                     self.water_time = t_center * WATER_WAVE_SPEED
                     # Deterministic, frame-exact spotlight animation (see
                     # SpotLightAnimation) -- NOT wall-clock based like the
@@ -4386,7 +5065,7 @@ class RayTracer:
                     self.exposure += (target_exposure - self.exposure) * adapt_k
 
                 if do_autofocus:
-                    R_af = camera_matrix(*self.camera_rot, self.camera_roll)
+                    R_af = quat_to_matrix(self.camera_quat)
                     forward = R_af[:, 2]
                     probe_depth(float(self.camera_pos[0]), float(self.camera_pos[1]), float(self.camera_pos[2]),
                                 float(forward[0]), float(forward[1]), float(forward[2]))
@@ -4395,17 +5074,17 @@ class RayTracer:
                     post_fx['dof_focus_distance'] = current_focus
 
                 color, depth = self.current_image_float()
-                curr_rot_roll = (float(self.camera_rot[0]), float(self.camera_rot[1]), float(self.camera_roll))
+                curr_pose_q = self.camera_quat.copy()
                 post_fx_on = post_fx.get('enabled', True)
                 if post_fx_on:
-                    R = camera_matrix(*self.camera_rot, self.camera_roll)
+                    R = quat_to_matrix(self.camera_quat)
                     flares = compute_flare_list(self, self.camera_pos, R)
                     camera_pose = (self.camera_pos, R, self.half_tan, self.aspect)
-                    motion_px = _camera_motion_px(prev_rot_roll, curr_rot_roll,
+                    motion_px = _camera_motion_px(prev_pose_q, curr_pose_q,
                                                    self.width, self.height, self.half_tan, self.aspect)
                 else:
                     flares, camera_pose, motion_px = None, None, None
-                prev_rot_roll = curr_rot_roll
+                prev_pose_q = curr_pose_q
                 # The heavy CPU work (post-fx) goes to the background
                 # pipeline thread -- submit() returns right away, so this
                 # loop can go straight on to frame fi+1's raytrace kernels
@@ -4456,10 +5135,55 @@ class RayTracer:
         print(f"\nEncoded {n_render} frame(s) directly to {label}: {out_path}")
         return out_path
 
+    # --- Camera orientation: quaternion is canonical, Euler is a view -----
+    # camera_rot (yaw, pitch) and camera_roll are kept as properties, not
+    # plain attributes, so every existing call site that reads/writes them
+    # (HUD text, menus, keyframe capture, --camera-data replay, etc.) keeps
+    # working unchanged while the REAL storage/composition is the
+    # quaternion in self._camera_quat -- see the block comment near
+    # camera_matrix for why.
+    @property
+    def camera_quat(self):
+        return self._camera_quat
+
+    @camera_quat.setter
+    def camera_quat(self, q):
+        self._camera_quat = quat_normalize(np.asarray(q, dtype=np.float64))
+
+    @property
+    def camera_rot(self):
+        """(yaw, pitch) radians, DERIVED from camera_quat for readability.
+        Assigning rebuilds the quaternion from Euler angles, preserving
+        the current roll."""
+        yaw, pitch, _roll = euler_from_quat(self._camera_quat)
+        return np.array([yaw, pitch], dtype=np.float32)
+
+    @camera_rot.setter
+    def camera_rot(self, value):
+        yaw, pitch = float(value[0]), float(value[1])
+        _y, _p, roll = euler_from_quat(self._camera_quat)
+        self._camera_quat = quat_from_euler(yaw, pitch, roll)
+
+    @property
+    def camera_roll(self):
+        """Roll (radians), DERIVED from camera_quat -- see camera_rot."""
+        return euler_from_quat(self._camera_quat)[2]
+
+    @camera_roll.setter
+    def camera_roll(self, value):
+        yaw, pitch, _old_roll = euler_from_quat(self._camera_quat)
+        self._camera_quat = quat_from_euler(yaw, pitch, float(value))
+
     # --- Serialization of the "shot" (camera + look/render params) --------
     def camera_dict(self):
+        yaw, pitch, roll = euler_from_quat(self._camera_quat)
         return {'pos': [float(x) for x in self.camera_pos],
-                'yaw': float(self.camera_rot[0]), 'pitch': float(self.camera_rot[1])}
+                # yaw/pitch/roll kept for readability/backward compatibility
+                # with older scene files that only understand Euler angles;
+                # 'quat' is the exact orientation (avoids any Euler
+                # round-trip loss) and is preferred on load when present.
+                'yaw': float(yaw), 'pitch': float(pitch), 'roll': float(roll),
+                'quat': [float(c) for c in self._camera_quat]}
 
 
 class PostProcessPipeline:
@@ -4867,7 +5591,7 @@ class ProgressiveRenderer:
         self.active = False
         self.post_fx = post_fx if post_fx is not None else dict(DEFAULT_POST_FX)
         self._frame_seed = 0
-        self._prev_rot_roll = None  # see apply_analog_camera's motion smear
+        self._prev_pose_q = None  # camera quaternion -- see apply_analog_camera's motion smear
 
     def start(self):
         self.tracer.reset_accumulation()
@@ -4881,16 +5605,15 @@ class ProgressiveRenderer:
         self.tracer.add_samples(self.samples_per_frame, max_bounce_override=self.tracer.live_max_bounce)
         color, depth = self.tracer.current_image_float()
 
-        R = camera_matrix(*self.tracer.camera_rot, self.tracer.camera_roll)
+        R = quat_to_matrix(self.tracer.camera_quat)
         flares = compute_flare_list(self.tracer, self.tracer.camera_pos, R)
         self._frame_seed += 1
         camera_pose = (self.tracer.camera_pos, R, self.tracer.half_tan, self.tracer.aspect)
-        curr_rot_roll = (float(self.tracer.camera_rot[0]), float(self.tracer.camera_rot[1]),
-                          float(self.tracer.camera_roll))
-        motion_px = _camera_motion_px(self._prev_rot_roll, curr_rot_roll,
+        curr_pose_q = self.tracer.camera_quat.copy()
+        motion_px = _camera_motion_px(self._prev_pose_q, curr_pose_q,
                                        self.tracer.width, self.tracer.height,
                                        self.tracer.half_tan, self.tracer.aspect)
-        self._prev_rot_roll = curr_rot_roll
+        self._prev_pose_q = curr_pose_q
         color = apply_post_processing(color, depth, flares, self.post_fx, frame_seed=self._frame_seed,
                                        camera_pose=camera_pose, motion_px=motion_px)
 
@@ -4963,7 +5686,7 @@ DEFAULT_POST_FX = {
                                    # "flat, milky" low-DR look of a small CCD sensor (0 = full range, off)
     'analog_highlight_clip': 0.28,# 0..1 -- how little headroom highlights get before blowing out to a hard,
                                    # detail-less white (lower = blows out sooner/harder)
-    'analog_grain': 0.06,         # grain amount (0..~0.15), stronger in shadows/midtones than highlights
+    'analog_grain': 0.01,         # grain amount (0..~0.15), stronger in shadows/midtones than highlights
     'analog_grain_size': 1.6,     # grain "clump" size in px -- 1 = fine per-pixel noise, >1 = coarser blobs
                                    # closer to real CCD/tape noise than flat per-pixel grain
     'analog_halation': 0.3,       # warm red-orange bleed around bright/blown-out highlights (0 = off)
@@ -5511,17 +6234,29 @@ def _camera_motion_px(prev_pose, curr_pose, w, h, half_tan, aspect):
     (a true per-pixel motion vector would also depend on scene depth and
     camera translation, which this ignores: rotation dominates the blur in
     handheld/camcorder footage, and that's the dominant term here).
-    prev_pose/curr_pose: (yaw, pitch, roll) radians, or prev_pose is None
-    for "no previous frame" (returns zero motion)."""
+
+    prev_pose/curr_pose are QUATERNIONS, and the shift is derived by
+    rotating the previous frame's forward axis into the current frame and
+    reading off where it lands, rather than by differencing yaw/pitch.
+    That difference matters at a gimbal-lock pose (pitch = +-90deg, which
+    real --camera-data recordings do pass through): there, yaw and roll
+    are not separately determined, so a yaw-difference reads as a huge
+    swing across a frame where the camera barely moved, and the analog
+    smear would briefly streak the whole image. prev_pose is None for "no
+    previous frame" (returns zero motion)."""
     if prev_pose is None:
         return 0.0, 0.0
-    p_yaw, p_pitch, _ = prev_pose
-    c_yaw, c_pitch, _ = curr_pose
-    d_yaw = _shortest_angle_diff(p_yaw, c_yaw)
-    d_pitch = c_pitch - p_pitch
+    # Forward (+Z) of the previous pose, expressed in the CURRENT camera's
+    # frame: R_curr^T @ R_prev @ [0,0,1].
+    R_prev = quat_to_matrix(prev_pose)
+    R_curr = quat_to_matrix(curr_pose)
+    v = R_curr.T @ (R_prev @ np.array([0.0, 0.0, 1.0]))
+    vz = float(v[2])
+    if vz <= 1e-4:
+        return 0.0, 0.0  # rotated past 90deg in one frame -- no sensible streak
     focal_px_x = (w / 2.0) / max(1e-4, half_tan * aspect)
     focal_px_y = (h / 2.0) / max(1e-4, half_tan)
-    return -d_yaw * focal_px_x, d_pitch * focal_px_y
+    return float(v[0]) / vz * focal_px_x, -float(v[1]) / vz * focal_px_y
 
 
 def apply_analog_camera(img, post_fx, frame_seed=0, motion_px=None):
@@ -6201,11 +6936,29 @@ def _resolve_asset_path(path, asset_dir):
 
 def save_scene_file(path, scene: Scene, tracer: RayTracer, post_fx=None,
                      camera_path: CameraPath = None, embed_assets=True):
-    """Writes a full scene (geometry + camera + lights + spotlights +
-    background + post-FX + bounce counts + camera keyframe path) to a
-    single JSON file at `path`. Image assets are embedded as base64 by
-    default (embed_assets=True) so the file is portable to another machine."""
+    """Writes a full scene to a single JSON file at `path`: geometry,
+    camera (as a quaternion plus a readable yaw/pitch/roll), lights,
+    spotlights, background (including the procedural sky gradient, the
+    sun/moon disc and the star field with their enable toggles), the
+    volumetric cloud layer, optical-zoom state, shading/exposure/caustic
+    settings, post-FX, bounce counts and the camera keyframe path with its
+    shake/inertia settings. Anything a scene can currently be configured
+    with round-trips through this file -- see load_scene_file for the
+    matching reader, which defaults every field added after a given
+    version so older scene files still load. Image assets are embedded as
+    base64 by default (embed_assets=True) so the file is portable to
+    another machine."""
     assets = {} if embed_assets else None
+    # Which entry in lights[] is the sun's own distant Light (added by
+    # add_sun_light/add_sun), so a reload can restore tracer.sun_light and
+    # keep set_sun_angle/set_sun_enabled able to move and mute it. Stored
+    # as an index rather than duplicating the Light itself.
+    sun_light_index = None
+    if getattr(tracer, 'sun_light', None) is not None:
+        for i, lt in enumerate(tracer.lights):
+            if lt is tracer.sun_light:
+                sun_light_index = i
+                break
     data = {
         'format': SCENE_FILE_FORMAT,
         'camera': tracer.camera_dict(),
@@ -6222,6 +6975,22 @@ def save_scene_file(path, scene: Scene, tracer: RayTracer, post_fx=None,
         'eye_adapt_speed': tracer.eye_adapt_speed,
         'caustics_enabled': bool(tracer.caustics_enabled),
         'background': tracer.background.to_dict(assets=assets),
+        # Volumetric cloud layer (see RayTracer.set_clouds) -- None when
+        # no cloud layer has ever been configured.
+        'clouds': dict(tracer.clouds) if tracer.clouds is not None else None,
+        # Optical zoom state (see set_zoom): base_fov_deg is the unzoomed
+        # FOV, 'fov' above is the CURRENT (zoomed) one, so both are needed
+        # to restore the shot exactly.
+        'base_fov_deg': float(tracer.base_fov_deg),
+        'zoom': float(tracer.zoom),
+        'zoom_target': float(tracer.zoom_target),
+        'zoom_speed': float(tracer.zoom_speed),
+        'zoom_min': float(tracer.zoom_min),
+        'zoom_max': float(tracer.zoom_max),
+        # Star-twinkle cadence for the interactive view (see
+        # set_star_update_interval); 0 = frozen field.
+        'star_update_interval': float(tracer.star_update_interval),
+        'sun_light_index': sun_light_index,
         'lights': [lt.to_dict() for lt in tracer.lights],
         'spotlights': [sl.to_dict() for sl in tracer.spotlights],
         'post_fx': dict(post_fx) if post_fx is not None else dict(DEFAULT_POST_FX),
@@ -6296,6 +7065,18 @@ def load_scene_file(path):
         'caustics_enabled': data.get('caustics_enabled', True),
         'background': background, 'lights': lights, 'spotlights': spotlights,
         'post_fx': post_fx, 'camera_path': camera_path,
+        # Fields added after the first version of this format -- each
+        # defaults to what the renderer used before it existed, so a scene
+        # file written by an older version still loads and looks the same.
+        'clouds': data.get('clouds'),
+        'base_fov_deg': data.get('base_fov_deg', data.get('fov', 65)),
+        'zoom': float(data.get('zoom', 1.0)),
+        'zoom_target': float(data.get('zoom_target', data.get('zoom', 1.0))),
+        'zoom_speed': float(data.get('zoom_speed', 1.0)),
+        'zoom_min': float(data.get('zoom_min', 1.0)),
+        'zoom_max': float(data.get('zoom_max', 8.0)),
+        'star_update_interval': float(data.get('star_update_interval', 1.0)),
+        'sun_light_index': data.get('sun_light_index'),
     }
 
 
@@ -6494,7 +7275,7 @@ def load_schematic(path, scene, offset=(0, 0, 0)):
 def build_demo_scene():
     scene = Scene()
     # Floor
-    #scene.add_box((0, -1.2, 0), (60, 1, 60), (200, 200, 205), roughness=0.35)
+    #scene.add_box((0, -1, 0), (60, 1, 60), (200, 200, 205), roughness=0.35)
     # Back wall
     #scene.add_box((0, 10, 20), (60, 20, 1), (230, 230, 235), roughness=0.6)
     # Glass block (transparent, glass IOR)
@@ -6721,6 +7502,58 @@ def keyframe_options_menu_cv(canvas, sw, sh, kf, idx):
             print("Invalid value -- zoom left unchanged.")
             result = ('cancel', None)
     return result
+
+
+def keyframe_list_menu_cv(canvas, sw, sh, camera_path, open_keyframe_fn):
+    """Blocking modal menu (F10): Up/Down selects a keyframe from the FULL
+    list, Enter opens ITS options menu (delegates straight to
+    open_keyframe_fn -- the SAME _open_keyframe_menu closure the crosshair/
+    O-key path already uses, so editing or deleting a keyframe from here
+    behaves identically, nothing is reimplemented twice), Esc closes.
+    Exists so a keyframe can be picked by name/index instead of needing
+    the camera physically aimed near one first -- handy once a path has
+    more keyframes than are easy to eyeball from a single viewpoint. Re-
+    reads camera_path.keyframes fresh every frame (rather than a cached
+    snapshot) so a delete from the sub-menu is reflected immediately, and
+    clamps the selection back into range if the list just got shorter."""
+    sel = 0
+    row_h = 24
+    top_y = 68
+    open_ = True
+    while open_:
+        n = len(camera_path.keyframes)
+        if n == 0:
+            break  # last keyframe was deleted from the sub-menu -- nothing left to list
+        sel = max(0, min(sel, n - 1))
+        canvas[:] = (16, 16, 20)
+        title = "Camera keyframes  --  Up/Down select, Enter opens its options, Esc close"
+        _draw_text_shadow(canvas, title, (24, 32))
+        viewport = max(1, (sh - top_y - 14) // row_h)
+        top = max(0, min(sel - viewport // 2, max(0, n - viewport)))
+        bottom = min(n, top + viewport)
+        for row, i in enumerate(range(top, bottom)):
+            kf = camera_path.keyframes[i]
+            y = top_y + row * row_h
+            is_sel = (i == sel)
+            color = (255, 255, 130) if is_sel else (195, 195, 195)
+            marker = ">" if is_sel else " "
+            label = (f"{marker} Keyframe #{i + 1}  --  pos {kf.pos[0]:.1f}, {kf.pos[1]:.1f}, "
+                     f"{kf.pos[2]:.1f}  --  speed {kf.speed:.2f}  --  zoom {kf.zoom:.2f}x"
+                     + ("  (hold)" if kf.duration is not None else ""))
+            _draw_text_shadow(canvas, label, (24, y), color=color, scale=_HUD_SCALE_SMALL)
+        cv2.imshow(WINDOW_NAME, canvas)
+        raw = cv2.waitKeyEx(30)
+        kind, val = classify_key(raw)
+        if kind == 'arrow':
+            if val == 'up':
+                sel = (sel - 1) % n
+            elif val == 'down':
+                sel = (sel + 1) % n
+        elif kind == 'char':
+            if val == 'enter':
+                open_keyframe_fn(sel)
+            elif val == 'esc':
+                open_ = False
 
 
 # =============================================================================
@@ -6963,15 +7796,60 @@ def _build_world_params(tracer, post_fx, camera_path, has_camera_data):
     add("Sky light strength", lambda: tracer.sky_light_strength,
         lambda v: setattr(tracer, 'sky_light_strength', v), 'float', 0.05, 0.0, 5.0)
     if tracer.background.sun is not None:
-        add("  Sun/moon intensity", lambda: tracer.background.sun['intensity'],
+        # Sun/moon gets its own tree, no longer hanging off "Sky light" --
+        # it is a separate object, not a property of the sky fill.
+        add("[Sun/moon] Enabled", lambda: tracer.background.sun_enabled,
+            lambda v: tracer.set_sun_enabled(v), 'bool')
+        add("  Intensity", lambda: tracer.background.sun['intensity'],
             lambda v: tracer.set_sun_intensity(v), 'float', 0.05, 0.0, 3.0)
+        add("  Azimuth (deg)", lambda: tracer.background.sun['azimuth_deg'],
+            lambda v: tracer.set_sun_angle(azimuth_deg=v), 'float', 2.0, 0.0, 360.0)
+        add("  Elevation (deg)", lambda: tracer.background.sun['elevation_deg'],
+            lambda v: tracer.set_sun_angle(elevation_deg=v), 'float', 2.0, -90.0, 90.0)
+        add("  Angular size (deg)", lambda: tracer.background.sun['angular_size_deg'],
+            lambda v: tracer.set_sun_appearance(angular_size_deg=v), 'float', 0.2, 0.1, 20.0)
+        add("  Glow (deg)", lambda: tracer.background.sun['glow_deg'],
+            lambda v: tracer.set_sun_appearance(glow_deg=v), 'float', 1.0, 0.0, 30.0)
+        add("  Color R", lambda: tracer.background.sun['color'][0],
+            lambda v: tracer.set_sun_appearance(color=(int(v), tracer.background.sun['color'][1],
+                                                        tracer.background.sun['color'][2])),
+            'int', 4, 0, 255)
+        add("  Color G", lambda: tracer.background.sun['color'][1],
+            lambda v: tracer.set_sun_appearance(color=(tracer.background.sun['color'][0], int(v),
+                                                        tracer.background.sun['color'][2])),
+            'int', 4, 0, 255)
+        add("  Color B", lambda: tracer.background.sun['color'][2],
+            lambda v: tracer.set_sun_appearance(color=(tracer.background.sun['color'][0],
+                                                        tracer.background.sun['color'][1], int(v))),
+            'int', 4, 0, 255)
     if tracer.background.stars is not None:
-        add("  Star brightness", lambda: tracer.background.stars['brightness'],
+        # Stars are their own top-level tree too -- previously these rows
+        # were indented under "Sky light" as if they were part of it.
+        add("[Stars] Enabled", lambda: tracer.background.stars_enabled,
+            lambda v: tracer.set_stars_enabled(v), 'bool')
+        add("  Brightness", lambda: tracer.background.stars['brightness'],
             lambda v: tracer.add_stars(**{**tracer.background.stars, 'brightness': v}),
             'float', 0.05, 0.0, 3.0)
-        add("  Star twinkle", lambda: tracer.background.stars['twinkle'],
+        add("  Twinkle", lambda: tracer.background.stars['twinkle'],
             lambda v: tracer.add_stars(**{**tracer.background.stars, 'twinkle': v}),
             'float', 0.05, 0.0, 1.0)
+        add("  Twinkle update interval (s, 0=off)", lambda: tracer.star_update_interval,
+            lambda v: tracer.set_star_update_interval(v), 'float', 0.25, 0.0, 30.0)
+        add("  Density", lambda: tracer.background.stars['density'],
+            lambda v: tracer.add_stars(**{**tracer.background.stars, 'density': v}),
+            'float', 0.0005, 0.0, 0.02)
+        add("  Min size (px)", lambda: tracer.background.stars['min_size'],
+            lambda v: tracer.add_stars(**{**tracer.background.stars, 'min_size': v}),
+            'float', 0.1, 0.1, 5.0)
+        add("  Max size (px)", lambda: tracer.background.stars['max_size'],
+            lambda v: tracer.add_stars(**{**tracer.background.stars, 'max_size': v}),
+            'float', 0.1, 0.1, 8.0)
+        add("  Color variation", lambda: tracer.background.stars['color_variation'],
+            lambda v: tracer.add_stars(**{**tracer.background.stars, 'color_variation': v}),
+            'float', 0.05, 0.0, 1.0)
+        add("  Above horizon only", lambda: tracer.background.stars['above_horizon_only'],
+            lambda v: tracer.add_stars(**{**tracer.background.stars, 'above_horizon_only': v}),
+            'bool')
 
     add("[Clouds] Enabled", lambda: bool(tracer.clouds and tracer.clouds.get('enabled')),
         lambda v: tracer.set_clouds(**{**(tracer.clouds or {}), 'enabled': v}), 'bool')
@@ -7008,7 +7886,8 @@ def _build_world_params(tracer, post_fx, camera_path, has_camera_data):
     return params
 
 
-def _build_camera_params(tracer, post_fx, camera_path, has_camera_data, res_getset, sample_getset):
+def _build_camera_params(tracer, post_fx, camera_path, has_camera_data, res_getset, sample_getset,
+                          camera_data=None):
     """Camera/renderer settings -- opened with F6 (see _build_world_params
     for F5's world/atmosphere settings, and _build_postfx_params for the
     `` ` `` key's remaining stylistic post-processing effects).
@@ -7059,6 +7938,16 @@ def _build_camera_params(tracer, post_fx, camera_path, has_camera_data, res_gets
             lambda v: setattr(camera_path, 'inertia', v), 'float', 0.05, 0.0, 3.0)
         add("  Bounce (overshoot)", lambda: camera_path.inertia_bounce,
             lambda v: setattr(camera_path, 'inertia_bounce', v), 'float', 0.05, 0.0, 1.0)
+    elif camera_data is not None and hasattr(camera_data, 'inertia'):
+        # Handheld/footstep shake stays off for recorded camera data (it
+        # already carries real motion -- see --handheld-shake's help), but
+        # inertia smoothing DOES apply to it: it smooths the recording's
+        # own jitter/abrupt direction changes rather than inventing
+        # motion. Editable live here, same as for keyframe paths.
+        add("Camera-data inertia (smoothing)", lambda: camera_data.inertia,
+            lambda v: setattr(camera_data, 'inertia', v), 'float', 0.05, 0.0, 3.0)
+        add("  Bounce (overshoot)", lambda: camera_data.inertia_bounce,
+            lambda v: setattr(camera_data, 'inertia_bounce', v), 'float', 0.05, 0.0, 1.0)
 
     add("Live resolution width (px)", res_getset['live_w_get'], res_getset['live_w_set'],
         'int', 16, 16, 1920)
@@ -7160,12 +8049,16 @@ def _postfx_row_geometry(params):
     return geom
 
 
-def postfx_menu_cv(canvas, sw, sh, params):
-    """Blocking modal menu (` key): Up/Down selects a row, Left/Right
-    adjusts its value (bool rows just flip either way), Enter also flips a
-    bool row, Esc closes. Every row edits the actual live tracer/post_fx/
-    camera_path object directly (see _build_postfx_params) -- closing this
-    menu doesn't "apply" anything, it already IS applied.
+def postfx_menu_cv(canvas, sw, sh, params, title=None, subtitle=None):
+    """Blocking modal menu (shared by the F5/F6/`` ` `` keys -- see
+    _build_world_params/_build_camera_params/_build_postfx_params for
+    what each one passes as `params`, and their call sites for the
+    title/subtitle each supplies so the header actually reflects which
+    menu is open): Up/Down selects a row, Left/Right adjusts its value
+    (bool rows just flip either way), Enter also flips a bool row, Esc
+    closes. Every row edits the actual live tracer/post_fx/camera_path
+    object directly -- closing this menu doesn't "apply" anything, it
+    already IS applied.
 
     Layout: root rows (an FX's own on/off/name row) sit at a fixed left
     margin; sub-property rows are indented further right and connected to
@@ -7177,6 +8070,14 @@ def postfx_menu_cv(canvas, sw, sh, params):
     instead of arbitrary whitespace, so values line up regardless of how
     long each label is.
     """
+    if title is None:
+        title = "Post-FX / renderer properties  --  Up/Down select, Left/Right adjust, Esc close"
+    if subtitle is None:
+        subtitle = ("[key] before a row = its own hotkey outside this menu, e.g. [Y] toggles "
+                    "the same eye-adaptation flag as pressing Y. A few other hotkeys don't have "
+                    "a matching row here: [T] focuses instantly (one-shot, not a persistent "
+                    "setting), [H] cycles handheld shake and [2] types in an exact camera "
+                    "position/angle (both are on CameraPath, not post-fx).")
     sel = 0
     n = len(params)
     geom = _postfx_row_geometry(params)
@@ -7201,12 +8102,6 @@ def postfx_menu_cv(canvas, sw, sh, params):
     open_ = True
     while open_ and n > 0:
         canvas[:] = (16, 16, 20)
-        title = "Post-FX / renderer properties  --  Up/Down select, Left/Right adjust, Esc close"
-        subtitle = ("[key] before a row = its own hotkey outside this menu, e.g. [Y] toggles "
-                    "the same eye-adaptation flag as pressing Y. A few other hotkeys don't have "
-                    "a matching row here: [T] focuses instantly (one-shot, not a persistent "
-                    "setting), [H] cycles handheld shake and [2] types in an exact camera "
-                    "position/angle (both are on CameraPath, not post-fx).")
         _draw_text_shadow(canvas, title, (24, 32))
         _draw_text_shadow(canvas, subtitle, (24, 50), color=(150, 150, 150), scale=_HUD_SCALE_SMALL)
         top = max(0, min(sel - viewport // 2, max(0, n - viewport)))
@@ -7395,17 +8290,33 @@ def parse_args(argv=None):
     p.add_argument('--print-keys', action='store_true',
                     help="Debug: print the raw code of every key pressed in the interactive window.")
     p.add_argument('--camera-data', type=str, default=None,
-                    help="Load a sensor_record JSON file and drive the camera position/rotation "
-                         "from it instead of the scene's camera keyframes (mutually exclusive with "
-                         "camera keyframes -- any existing keyframes on the loaded/built scene are "
-                         "dropped). Position is x/y/z (m), rotation is x/y/z (deg, mapped to "
-                         "pitch/yaw/roll). See --camera-multiplier / --camera-offset / --camera-sync.")
+                    help="Load a camera recording and drive the camera position/rotation from it "
+                         "instead of the scene's camera keyframes (mutually exclusive with camera "
+                         "keyframes -- any existing keyframes on the loaded/built scene are dropped). "
+                         "Two file formats are auto-detected: a sensor_record JSON (position x/y/z "
+                         "in m, rotation x/y/z in deg mapped to pitch/yaw/roll), or a plain-text "
+                         "quaternion track like 'Map_Race_#01.txt' (one ':'-separated "
+                         "t:x:y:z:qx:qy:qz:qw sample per line -- see SensorCameraData's docstring). "
+                         "Orientation is carried/interpolated as a quaternion either way -- see "
+                         "--camera-multiplier / --camera-offset / --camera-rot-offset / --camera-sync "
+                         "/ --inertia.")
     p.add_argument('--camera-multiplier', type=float, default=1.0,
                     help="With --camera-data: multiplies every sample's position (x/y/z) by this "
                          "factor before applying --camera-offset.")
     p.add_argument('--camera-offset', type=str, default=None,
-                    help="With --camera-data: adds this x,y,z offset (world units) to every sample's "
-                         "position AFTER --camera-multiplier, e.g. --camera-offset 0,5,0.")
+                    help="With --camera-data: adds a position (and optionally rotation) offset to "
+                         "every sample, applied AFTER --camera-multiplier. Either 3 values "
+                         "'x,y,z' (position only, world units -- the original behaviour), or 6 "
+                         "'x,y,z,r,p,y' / 'x,y,z/r,p,y' values adding a r,p,y rotation offset (degrees) "
+                         "on top -- e.g. --camera-offset 0,5,0,0,0,90. Prefer the separate "
+                         "--camera-rot-offset flag for the rotation part; if both are given, "
+                         "--camera-rot-offset wins.")
+    p.add_argument('--camera-rot-offset', type=str, default=None,
+                    help="With --camera-data: rotation offset 'r,p,y' (degrees -- roll,pitch,yaw) "
+                         "applied to every sample's orientation, composed as a quaternion (see the "
+                         "quaternion utilities near camera_matrix) so it stacks cleanly regardless "
+                         "of the recording's own orientation. Preferred over the 6-value form of "
+                         "--camera-offset; takes precedence if both are given.")
     p.add_argument('--camera-sync', action='store_true',
                     help="With --camera-data --headless --video: use every recorded sample as exactly "
                          "one output video frame (instead of resampling the recording at --fps-spaced "
@@ -7432,17 +8343,33 @@ def parse_args(argv=None):
                          "vs. the constant idle sway) -- 1.0 (default) = normal, 0 = idle sway only, "
                          ">1 = exaggerated footsteps. Has no effect if --handheld-shake is 0.")
     p.add_argument('--inertia', type=float, default=0.0,
-                    help="Adds 'momentum' to camera KEYFRAME paths (P/O -- ignored for "
-                         "--camera-data/--camera-stream): instead of instantly snapping onto each "
-                         "new segment's direction, the camera eases/overshoots through direction "
-                         "changes like a real handheld camera can't instantly reverse. 0 = off "
-                         "(exact old linear interpolation), higher = more momentum/lag. Distinct "
-                         "from --handheld-shake (that's noise on top of the path; this changes how "
-                         "the path itself is followed) -- the two stack fine together.")
+                    help="Adds 'momentum' to camera motion: instead of instantly snapping onto each "
+                         "new direction, the camera eases/overshoots through direction changes like "
+                         "a real handheld camera can't instantly reverse. Applies BOTH to camera "
+                         "KEYFRAME paths (P/O) and, when > 0, to --camera-data replay, where it "
+                         "smooths the recording's own jitter and abrupt direction changes (position "
+                         "spring + quaternion rotational spring -- see SensorCameraData. "
+                         "_build_inertia_cache). 0 = off (exact linear/slerp interpolation of the "
+                         "raw data), higher = more momentum/lag. Distinct from --handheld-shake "
+                         "(that's noise on top of the path; this changes how the path itself is "
+                         "followed) -- the two stack fine together.")
     p.add_argument('--inertia-bounce', type=float, default=None,
                     help="Damping for --inertia's spring: 0 = critically damped (smooth ease, no "
                          "overshoot), 1 (default 0.35) = strongly underdamped (visibly bounces past "
                          "the target before settling). Has no effect if --inertia is 0.")
+    p.add_argument('--no-sun', action='store_true',
+                    help="Hide the sun/moon disc (and mute the real sun light it casts, if any) "
+                         "without discarding its settings -- the scene keeps its angle/color/size, "
+                         "so it can be switched back on from the F5 world menu. Also toggleable "
+                         "there at any time.")
+    p.add_argument('--no-stars', action='store_true',
+                    help="Hide the star field without discarding its settings (density/seed/sizes "
+                         "are kept) -- toggleable again from the F5 world menu.")
+    p.add_argument('--star-update-interval', type=float, default=None,
+                    help="How often (seconds) the interactive view advances the star twinkle; "
+                         "0 freezes the field exactly as baked, which is also the cheapest option "
+                         "(each update re-bakes and re-uploads the sky texture). Default 1.0. No "
+                         "effect on offline video renders, which sample the twinkle per frame.")
     p.add_argument('--zoom', type=float, default=1.0,
                     help="Starting optical zoom multiplier (see the ;/' keys), 1.0 = unzoomed. Also "
                          "used as the constant zoom for a --headless render/video unless the camera "
@@ -7478,6 +8405,41 @@ def _parse_xyz(s):
     if len(parts) != 3:
         raise ValueError(f"Expected 'x,y,z', got: {s!r}")
     return tuple(parts)
+
+
+def _parse_rot_offset(s):
+    """Parses a 'r,p,y' rotation offset (degrees -- roll,pitch,yaw) into an
+    offset quaternion (see --camera-rot-offset), composed with
+    quat_from_euler using the SAME yaw/pitch/roll convention as
+    camera_matrix so it stacks predictably with a sample's own
+    orientation (see SensorCameraData.load's rot_offset_quat)."""
+    parts = [float(x) for x in s.split(',')]
+    if len(parts) != 3:
+        raise ValueError(f"Expected 'r,p,y' (degrees), got: {s!r}")
+    roll, pitch, yaw = (math.radians(p) for p in parts)
+    return quat_from_euler(yaw, pitch, roll)
+
+
+def _parse_camera_offset(s):
+    """Parses --camera-offset, accepting either the original 3-value
+    'x,y,z' position-only form, or a 6-value position+rotation form:
+    'x,y,z,r,p,y' (6 comma-separated values) or 'x,y,z/r,p,y' (position
+    triplet, '/', rotation triplet). Returns (pos_offset_xyz,
+    rot_offset_quat_or_None)."""
+    s = s.strip()
+    if '/' in s:
+        pos_part, _, rot_part = s.partition('/')
+        pos = _parse_xyz(pos_part)
+        rot_q = _parse_rot_offset(rot_part)
+        return pos, rot_q
+    parts = [p.strip() for p in s.split(',')]
+    if len(parts) == 3:
+        return tuple(float(p) for p in parts), None
+    if len(parts) == 6:
+        pos = tuple(float(p) for p in parts[:3])
+        rot_q = _parse_rot_offset(','.join(parts[3:]))
+        return pos, rot_q
+    raise ValueError(f"Expected 'x,y,z' or 'x,y,z,r,p,y' (or 'x,y,z/r,p,y'), got: {s!r}")
 
 
 # =============================================================================
@@ -7568,11 +8530,17 @@ def main(argv=None):
         eye_adapt_speed = loaded['eye_adapt_speed']
     else:
         bg = Background(color=(20, 25, 35), brightness=1.0)
-        bg.set_sky_gradient(curve=0.2)
+        bg.set_sky_gradient(
+            zenith_color=(5, 12, 30),
+            horizon_color=(35, 55, 85),
+            ground_color=(10, 12, 18),
+            curve=0.4,
+            resolution=(800, 400)
+        )
         lights = [
-            Light((265, 324, -141), (255, 251, 235), 1.1),   # key light, slightly warm
+            #Light((-18.41, 29.48, -12.73), (255, 251, 235), 1.1),   # key light, slightly warm
             #Light((-1.47, -4.69, 6.94), (255, 251, 235), 1.0),      # fill light, cooler blue
-            #Light((-5.88, 16.79, -13.09), (255, 251, 235), 0.3),
+            Light((-5.88, 16.79, -13.09), (255, 251, 235), 0.0),
         ]
         spotlights = [
             #SpotLight((0.0, 20.0, -5.0), (0.15, -1.0, 0.25), color=(16, 255, 255), brightness=0.3, cone_angle=14.0, softness=0.04),
@@ -7605,9 +8573,66 @@ def main(argv=None):
     tracer.eye_adapt_enabled = eye_adapt_enabled
     tracer.eye_adapt_speed = eye_adapt_speed
     tracer.camera_pos = np.array(cam_cfg['pos'], dtype=np.float32)
-    tracer.camera_rot = np.array([cam_cfg.get('yaw', 0.0), cam_cfg.get('pitch', 0.0)], dtype=np.float32)
+    if 'quat' in cam_cfg:
+        # Scenes saved by this version carry the exact quaternion --
+        # use it directly rather than round-tripping through Euler.
+        tracer.camera_quat = np.array(cam_cfg['quat'], dtype=np.float64)
+    else:
+        # Backward compatibility with older scene files, which only ever
+        # had yaw/pitch (and never a 'roll' or 'quat' field at all):
+        # convert their Euler angles to a quaternion on load, same as
+        # setting camera_rot/camera_roll always does under the hood.
+        tracer.camera_rot = np.array([cam_cfg.get('yaw', 0.0), cam_cfg.get('pitch', 0.0)], dtype=np.float32)
+        tracer.camera_roll = float(cam_cfg.get('roll', 0.0))
     tracer.zoom_speed = max(1e-4, float(args.zoom_speed))
-    tracer.set_zoom(float(args.zoom))
+
+    if loaded is not None:
+        # A loaded scene already carries its own background (sky gradient,
+        # sun/moon disc, star field, and whether each is enabled -- see
+        # Background.from_dict) and its own lights list, which ALREADY
+        # includes the sun's distant Light if it had one. Calling add_sun/
+        # add_stars here would overwrite the loaded sun with the default
+        # one and append a second sun Light every time the scene was
+        # reloaded, so the defaults below are for a freshly-built scene
+        # only. Re-point tracer.sun_light at the light that was exported
+        # as the sun, so set_sun_angle/set_sun_enabled can still move and
+        # mute it.
+        sun_idx = loaded.get('sun_light_index')
+        if sun_idx is not None and 0 <= sun_idx < len(tracer.lights):
+            tracer.sun_light = tracer.lights[sun_idx]
+        clouds_cfg = loaded.get('clouds')
+        if clouds_cfg:
+            tracer.set_clouds(**clouds_cfg)
+        tracer.set_star_update_interval(loaded.get('star_update_interval', 1.0))
+        tracer.base_fov_deg = float(loaded.get('base_fov_deg', tracer.base_fov_deg))
+        tracer.zoom_min = float(loaded.get('zoom_min', tracer.zoom_min))
+        tracer.zoom_max = float(loaded.get('zoom_max', tracer.zoom_max))
+        tracer.zoom_speed = max(1e-4, float(loaded.get('zoom_speed', tracer.zoom_speed)))
+        tracer.set_zoom(float(loaded.get('zoom', 1.0)))
+        tracer.zoom_target = float(loaded.get('zoom_target', tracer.zoom))
+        # The sky texture now reflects the loaded sun/stars + their enable
+        # flags -- push it to the GPU.
+        if BG_FIELD is not None:
+            BG_FIELD.from_numpy(tracer.background.image)
+        tracer.reset_accumulation()
+    else:
+        tracer.add_sun()
+        tracer.add_stars()
+
+    # Explicit CLI flags win over whatever the scene carried. --zoom-speed
+    # and --zoom both have non-None defaults, so "explicit" here means
+    # "differs from the default" -- otherwise simply loading a scene would
+    # silently reset its stored zoom to 1.0x at its default speed.
+    if abs(float(args.zoom_speed) - 1.0) > 1e-9:
+        tracer.zoom_speed = max(1e-4, float(args.zoom_speed))
+    if loaded is None or abs(float(args.zoom) - 1.0) > 1e-6:
+        tracer.set_zoom(float(args.zoom))
+    if args.star_update_interval is not None:
+        tracer.set_star_update_interval(args.star_update_interval)
+    if args.no_sun:
+        tracer.set_sun_enabled(False)
+    if args.no_stars:
+        tracer.set_stars_enabled(False)
 
     # --- --camera-data: sensor recording drives the camera instead of ------
     # hand-placed camera keyframes. The two are mutually exclusive: any
@@ -7631,14 +8656,47 @@ def main(argv=None):
         print("--camera-data and --camera-stream are mutually exclusive -- ignoring --camera-stream.")
     if args.camera_data:
         cam_multiplier = args.camera_multiplier
-        cam_offset = _parse_xyz(args.camera_offset) if args.camera_offset else (0.0, 0.0, 0.0)
-        sensor_data = SensorCameraData.load(args.camera_data, multiplier=cam_multiplier, offset=cam_offset)
+        # --camera-offset takes either 'x,y,z' (position only, as before) or
+        # 'x,y,z,r,p,y' / 'x,y,z/r,p,y' (position + rotation, degrees) --
+        # see _parse_camera_offset. The separate --camera-rot-offset flag is
+        # the preferred way to give the rotation half, and wins if both are
+        # supplied.
+        cam_offset = (0.0, 0.0, 0.0)
+        cam_rot_quat = None
+        if args.camera_offset:
+            cam_offset, cam_rot_quat = _parse_camera_offset(args.camera_offset)
+        if args.camera_rot_offset:
+            rot_q = _parse_rot_offset(args.camera_rot_offset)
+            if cam_rot_quat is not None:
+                print("Both --camera-offset's rotation part and --camera-rot-offset given -- "
+                      "using --camera-rot-offset.")
+            cam_rot_quat = rot_q
+        sensor_data = SensorCameraData.load(args.camera_data, multiplier=cam_multiplier,
+                                             offset=cam_offset, rot_offset_quat=cam_rot_quat)
+        # --inertia/--inertia-bounce apply to camera-data replay too, not
+        # just to keyframe paths: camera_path is discarded just below, so
+        # setting them only on it (as the code used to) silently did
+        # nothing whenever --camera-data was in play. SensorCameraData runs
+        # the same spring (position + quaternion rotation) over the
+        # recorded trajectory -- see its _build_inertia_cache.
+        if args.inertia:
+            sensor_data.inertia = float(args.inertia)
+        if args.inertia_bounce is not None:
+            sensor_data.inertia_bounce = float(args.inertia_bounce)
         if len(camera_path.keyframes) > 0:
             print(f"--camera-data given -- dropping {len(camera_path.keyframes)} existing camera "
                   f"keyframe(s) from the scene in favor of the sensor recording.")
         camera_path = CameraPath()
         print(f"Loaded {len(sensor_data.samples)} camera samples from '{args.camera_data}' "
               f"({sensor_data.total_duration():.2f}s)")
+        if cam_rot_quat is not None:
+            y_off, p_off, r_off = euler_from_quat(cam_rot_quat)
+            print(f"Camera rotation offset applied: roll/pitch/yaw = "
+                  f"{math.degrees(r_off):.1f} / {math.degrees(p_off):.1f} / "
+                  f"{math.degrees(y_off):.1f} deg")
+        if sensor_data.inertia > 0.0:
+            print(f"Camera-data inertia smoothing: {sensor_data.inertia:.2f} "
+                  f"(bounce {sensor_data.inertia_bounce:.2f})")
         if args.camera_get_fps:
             avg_fps = sensor_data.average_fps()
             print(f"Sensor recording average fps: {avg_fps:.3f}")
@@ -7646,8 +8704,10 @@ def main(argv=None):
                 video_fps = avg_fps
         pos0, yaw0, pitch0, roll0 = sensor_data.sample(0.0)
         tracer.camera_pos = pos0.astype(np.float32)
-        tracer.camera_rot = np.array([yaw0, pitch0], dtype=np.float32)
-        tracer.camera_roll = roll0
+        # Set the quaternion directly rather than round-tripping the pose
+        # back through the Euler setters (camera_rot/camera_roll), which
+        # would recompose what the recording already gave us as rotation.
+        tracer.camera_quat = quat_from_euler(yaw0, pitch0, roll0)
     elif args.camera_stream:
         if args.headless and args.video:
             print("--camera-stream doesn't have a fixed length, so it can't drive a --headless "
@@ -7745,6 +8805,23 @@ def main(argv=None):
     camera_pos = tracer.camera_pos.astype(np.float64)
     camera_rot = tracer.camera_rot.astype(np.float64)
     camera_roll = float(tracer.camera_roll)  # radians -- 0 unless --camera-data supplied one at t=0
+    # While a path/recording is replaying, the pose comes in as a
+    # quaternion and THAT is what gets rendered -- camera_rot/camera_roll
+    # are refreshed from it for the HUD only. None means "not replaying",
+    # i.e. free-look, where the Euler locals (arrow-key deltas) are the
+    # source of truth and get composed into a quaternion instead. See
+    # _current_camera_quat just below.
+    replay_quat = None
+
+    def _current_camera_quat():
+        """The orientation actually being rendered this frame: the replay
+        quaternion if one is active (gimbal-lock-safe -- a recording can
+        legitimately pass through pitch = +-90deg, where yaw/roll stop
+        being separately determined), else one composed from the
+        free-look Euler locals."""
+        if replay_quat is not None:
+            return replay_quat
+        return quat_from_euler(camera_rot[0], camera_rot[1], camera_roll)
     roll_speed = 0.015   # radians per "held" tick (,/. keys) -- matches look_speed
     move_speed = 0.6
     look_speed = 0.015   # radians per "held" tick (arrow keys) -- also used as a base for mouse-drag
@@ -7880,13 +8957,17 @@ def main(argv=None):
             if is_live_stream:
                 # A live stream never "ends" -- keep following the freshest
                 # pose every frame until the user presses I again to stop.
-                live_pose = active_path.sample(None)
+                live_pose = active_path.sample_quat(None)
                 if live_pose is not None:
-                    rp_pos, rp_yaw, rp_pitch, rp_roll = live_pose
+                    rp_pos, rp_quat = live_pose
                     camera_pos[:] = rp_pos
-                    camera_rot[0] = rp_yaw
-                    camera_rot[1] = rp_pitch
-                    camera_roll = rp_roll
+                    # The quaternion is the pose that actually gets
+                    # rendered; camera_rot/camera_roll are refreshed from
+                    # it only so the HUD readout stays truthful. Going the
+                    # other way (Euler -> render) would lose the
+                    # orientation at pitch = +-90deg.
+                    replay_quat = rp_quat
+                    camera_rot[0], camera_rot[1], camera_roll = euler_from_quat(rp_quat)
                 any_input = True
             else:
                 elapsed_replay = time.time() - replay_start_time
@@ -7897,16 +8978,17 @@ def main(argv=None):
                                      else camera_path.total_duration())
                 if elapsed_replay >= replay_total:
                     replaying = False
+                    replay_quat = None
                     camera_roll = 0.0  # reset roll after a --camera-data replay ends (see module notes)
                     print("Path replay finished.")
                 else:
-                    rp_pos, rp_yaw, rp_pitch, rp_roll = active_path.sample(elapsed_replay)
+                    rp_pos, rp_quat = active_path.sample_quat(elapsed_replay)
                     camera_pos[:] = rp_pos
-                    camera_rot[0] = rp_yaw
-                    camera_rot[1] = rp_pitch
-                    camera_roll = rp_roll
+                    replay_quat = rp_quat
+                    camera_rot[0], camera_rot[1], camera_roll = euler_from_quat(rp_quat)
                     any_input = True
         else:
+            replay_quat = None  # free-look: the Euler locals drive the camera again
             R = camera_matrix(*camera_rot, camera_roll)
 
             # WASD follows the camera's viewing direction (yaw) but is
@@ -7986,7 +9068,7 @@ def main(argv=None):
             tracer.half_tan = math.tan(tracer.fov_rad / 2)
             any_input = True
 
-        R = camera_matrix(*camera_rot, camera_roll)
+        R = quat_to_matrix(_current_camera_quat())
 
         n_pt_lights = len(tracer.lights)
         n_all_lights = n_pt_lights + len(tracer.spotlights)
@@ -8154,7 +9236,8 @@ def main(argv=None):
                 camera_roll = new_roll
             elif ch == '`' and inp.one_shot('postfx_menu', debounce=0.3):
                 params = _build_postfx_params(tracer, post_fx, camera_path, has_camera_data)
-                postfx_menu_cv(canvas, WIN_W, WIN_H, params)
+                postfx_menu_cv(canvas, WIN_W, WIN_H, params,
+                               title="Post-FX properties  --  Up/Down select, Left/Right adjust, Esc close")
             elif ch == 'p' and inp.one_shot('add_keyframe'):
                 if has_camera_data:
                     print("Camera keyframes are disabled while --camera-data is active.")
@@ -8242,33 +9325,53 @@ def main(argv=None):
                     out_path = input("Export current scene to (path, e.g. myscene.json): ").strip()
                     if out_path:
                         tracer.camera_pos = camera_pos.astype(np.float32)
-                        tracer.camera_rot = camera_rot.astype(np.float32)
-                        tracer.camera_roll = camera_roll
+                        # One quaternion set rather than camera_rot-then-
+                        # camera_roll: same result, but composes the whole
+                        # orientation in one go instead of round-tripping
+                        # through Euler twice.
+                        tracer.camera_quat = _current_camera_quat()
                         save_scene_file(out_path, scene, tracer, post_fx=post_fx,
                                          camera_path=camera_path, embed_assets=True)
                 except Exception as e:
                     print(f"Export failed: {e}")
         elif kind == 'func':
-            # F10: per-keyframe options menu -- an alternate binding for the
-            # same action as O (see _open_keyframe_menu above), just reachable
-            # without needing a letter key free of other bindings.
+            # F10: keyframe LIST menu -- lets you pick a keyframe by name/
+            # index (Up/Down + Enter) instead of needing the camera aimed
+            # near one first. O (see near targeted_kf_idx below) is still
+            # the quick "edit whichever keyframe I'm looking at" shortcut;
+            # this is the "browse all of them" one.
             if val == 'f10' and inp.one_shot('kf_menu'):
                 if has_camera_data:
                     print("Camera keyframes are disabled while --camera-data is active.")
-                elif targeted_kf_idx is not None:
-                    _open_keyframe_menu(targeted_kf_idx)
+                elif not camera_path.keyframes:
+                    print("No camera keyframes yet -- press P to add one first.")
+                else:
+                    keyframe_list_menu_cv(canvas, WIN_W, WIN_H, camera_path, _open_keyframe_menu)
             elif val == 'f5' and inp.one_shot('world_menu', debounce=0.3):
                 # World/atmosphere/lighting settings (fog, clouds, sky, sun,
                 # stars, caustics, god rays) -- see _build_world_params.
                 params = _build_world_params(tracer, post_fx, camera_path, has_camera_data)
-                postfx_menu_cv(canvas, WIN_W, WIN_H, params)
+                missing = []
+                if tracer.background.sun is None:
+                    missing.append("sun/moon (tracer.add_sun(...) to add one)")
+                if tracer.background.stars is None:
+                    missing.append("stars (tracer.add_stars(...) to add them)")
+                world_subtitle = ("World / atmosphere / lighting settings.")
+                if missing:
+                    world_subtitle += "  Not configured yet, so no rows for: " + "; ".join(missing) + "."
+                postfx_menu_cv(canvas, WIN_W, WIN_H, params,
+                               title="World settings (F5)  --  Up/Down select, Left/Right adjust, Esc close",
+                               subtitle=world_subtitle)
             elif val == 'f6' and inp.one_shot('camera_menu', debounce=0.3):
                 # Camera/renderer settings (exposure, zoom, DoF, camera
                 # shake, resolution, samples-per-mode) -- see
                 # _build_camera_params.
                 params = _build_camera_params(tracer, post_fx, camera_path, has_camera_data,
-                                              res_getset, sample_getset)
-                postfx_menu_cv(canvas, WIN_W, WIN_H, params)
+                                              res_getset, sample_getset,
+                                              camera_data=sensor_data)
+                postfx_menu_cv(canvas, WIN_W, WIN_H, params,
+                               title="Camera / renderer settings (F6)  --  Up/Down select, "
+                                     "Left/Right adjust, Esc close")
 
         if autofocus_flash > 0.0:
             autofocus_flash = max(0.0, autofocus_flash - 1.0 / 60.0)
@@ -8287,19 +9390,27 @@ def main(argv=None):
         if tracer.spotlights and tracer.update_spotlight_animations(frame_dt):
             any_input = True
 
-        # Star twinkle: throttled to roughly once a second (see
-        # RayTracer.update_stars' docstring for why) rather than every
-        # frame -- "occasionally shift slightly", not a strobe.
-        if tracer.background.stars is not None and now_t >= _next_star_update:
+        # Star twinkle: throttled (see RayTracer.update_stars' docstring
+        # for why) rather than advanced every frame -- "occasionally shift
+        # slightly", not a strobe. The interval is
+        # tracer.star_update_interval (default 1s, adjustable in the F5
+        # menu / --star-update-interval); 0 turns the update off and
+        # leaves the field frozen as baked. Skipped entirely while the
+        # star field is hidden.
+        if (tracer.background.stars is not None and tracer.background.stars_enabled
+                and tracer.star_update_interval > 0.0 and now_t >= _next_star_update):
             tracer.update_stars(now_t - _star_clock_start)
-            _next_star_update = now_t + 1.0
+            _next_star_update = now_t + tracer.star_update_interval
             any_input = True
 
         # --- Draw the frame ---
         if live_render:
             tracer.camera_pos = camera_pos.astype(np.float32)
-            tracer.camera_rot = camera_rot.astype(np.float32)
-            tracer.camera_roll = camera_roll
+            # Single quaternion composition per frame (see the note at the
+            # X-key export above) -- the interactive loop keeps yaw/pitch/
+            # roll as plain locals because arrow-key look IS an Euler
+            # delta, and converts once, here, at that boundary.
+            tracer.camera_quat = _current_camera_quat()
             canvas = prog.step(any_input, (WIN_W, WIN_H))
         else:
             canvas[:] = (30, 25, 20)
