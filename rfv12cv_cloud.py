@@ -1807,6 +1807,10 @@ SPOT_POS = SPOT_DIR = SPOT_COLOR = SPOT_BRIGHTNESS = None
 SPOT_COS_OUTER = SPOT_COS_INNER = SPOT_VIS = None
 CLOUD_ENABLED = CLOUD_BASE = CLOUD_TOP = CLOUD_DENSITY = CLOUD_COVERAGE = None
 CLOUD_SCALE = CLOUD_COLOR = CLOUD_WIND = CLOUD_STEPS = CLOUD_LIGHT_STEPS = CLOUD_SUN_DIR = None
+CLOUD_TIME = None                           # "billow" offset -- see _cloud_density: shifts the
+                                             # noise field's OWN vertical sampling axis over time,
+                                             # so cross-sections morph/churn instead of just sliding
+                                             # sideways the way CLOUD_WIND (a rigid xz translation) does.
 PROBE_DEPTH = None
 WB_MIN = WB_MAX = WB_IOR = N_WATER_FIELD = None
 WATER_TIME = None                           # time (seconds) used to make the water ripple
@@ -1921,6 +1925,7 @@ def alloc_cloud_fields():
     are actually used."""
     global CLOUD_ENABLED, CLOUD_BASE, CLOUD_TOP, CLOUD_DENSITY, CLOUD_COVERAGE
     global CLOUD_SCALE, CLOUD_COLOR, CLOUD_WIND, CLOUD_STEPS, CLOUD_LIGHT_STEPS, CLOUD_SUN_DIR
+    global CLOUD_TIME
     CLOUD_ENABLED = ti.field(ti.i32, shape=())
     CLOUD_BASE = ti.field(ti.f32, shape=())
     CLOUD_TOP = ti.field(ti.f32, shape=())
@@ -1932,6 +1937,7 @@ def alloc_cloud_fields():
     CLOUD_STEPS = ti.field(ti.i32, shape=())
     CLOUD_LIGHT_STEPS = ti.field(ti.i32, shape=())
     CLOUD_SUN_DIR = ti.Vector.field(3, ti.f32, shape=())
+    CLOUD_TIME = ti.field(ti.f32, shape=())
     CLOUD_ENABLED[None] = 0
     CLOUD_BASE[None] = 100.0
     CLOUD_TOP[None] = 160.0
@@ -1943,6 +1949,7 @@ def alloc_cloud_fields():
     CLOUD_STEPS[None] = 24
     CLOUD_LIGHT_STEPS[None] = 4
     CLOUD_SUN_DIR[None] = [0.0, 1.0, 0.0]
+    CLOUD_TIME[None] = 0.0
 
 # =============================================================================
 # 10) Taichi funcs -- BVH traversal, ray-triangle intersection (also returns
@@ -2210,7 +2217,14 @@ def _cloud_density(p: vec3) -> ti.f32:
     if vert > 0.0:
         scale = 1.0 / ti.max(1e-3, CLOUD_SCALE[None])
         wind = CLOUD_WIND[None]
-        wp = vec3((p[0] + wind[0]) * scale, y * scale * 0.5, (p[2] + wind[1]) * scale)
+        # CLOUD_WIND translates the xz sample position -- shapes slide
+        # sideways but keep the exact same silhouette (a rigid drift).
+        # CLOUD_TIME instead offsets the vertical sampling axis, which
+        # feeds the SAME 3D noise volume -- so advancing it slides a
+        # moving cross-section through that volume, and the cauliflower
+        # shapes genuinely churn/morph over time ("billow") rather than
+        # just translating. Combine both for clouds that drift AND billow.
+        wp = vec3((p[0] + wind[0]) * scale, (y * 0.5 + CLOUD_TIME[None]) * scale, (p[2] + wind[1]) * scale)
         n = _cloud_fbm(wp)
         # `coverage` (0..1) raises/lowers how much of the noise has to
         # clear before it counts as any density at all -- low coverage =
@@ -4501,7 +4515,8 @@ class RayTracer:
         self.reset_accumulation()
 
     def set_clouds(self, enabled=True, base=100.0, top=160.0, density=0.08, coverage=0.5,
-                   scale=60.0, color=(255, 255, 255), steps=24, light_steps=4, wind=(0.0, 0.0)):
+                   scale=60.0, color=(255, 255, 255), steps=24, light_steps=4, wind=(0.0, 0.0),
+                   billow=0.0, wind_speed=(0.0, 0.0), billow_speed=0.0):
         """Enables/configures a real, GPU-raymarched volumetric cloud layer
         -- a horizontal band between world-Y `base` and `top`, filled with
         a noise-based density field (see _cloud_fbm/_cloud_density near
@@ -4555,10 +4570,23 @@ class RayTracer:
           camera-visible one -- see _cloud_shadow_transmittance.)
         wind: (x, z) world-space offset added to the noise sample
           position -- see set_cloud_wind for animating this over time
-          (e.g. from render_video) to drift the cloud shapes without
-          regenerating them (the noise itself doesn't change, just where
-          in it you're sampling, so shapes stay self-consistent frame to
-          frame instead of flickering).
+          (e.g. from render_video) to drift the cloud shapes sideways
+          without regenerating them (the noise itself doesn't change, just
+          where in it you're sampling, so shapes stay self-consistent frame
+          to frame instead of flickering).
+        billow: offset added to the noise field's OWN vertical sampling
+          axis (independent of world Y, which stays fixed per point) --
+          see set_cloud_billow for animating this over time. Unlike wind
+          (a rigid xz translation that slides shapes without changing
+          them), advancing billow moves which cross-section of the noise
+          volume gets sampled, so puffs slowly swell/split/merge instead
+          of just sliding -- combine both for clouds that drift AND billow.
+        wind_speed/billow_speed: (x, z) world-units/second and units/second
+          -- continuous drift/billow speeds; see set_cloud_drift for the
+          convenience call that sets these two without having to repeat
+          every other cloud parameter. Stored on self.clouds (so they
+          round-trip through save_scene_file/load_scene_file like every
+          other cloud setting) rather than as separate attributes.
 
         Uses whatever sun direction Background.set_sun last configured
         (straight up if none) for the self-shadow term -- re-calling this
@@ -4570,8 +4598,22 @@ class RayTracer:
                        'density': max(0.0, float(density)), 'coverage': max(0.0, min(1.0, float(coverage))),
                        'scale': max(1.0, float(scale)), 'color': [int(c) for c in color[:3]],
                        'steps': max(1, int(steps)), 'light_steps': max(1, int(light_steps)),
-                       'wind': [float(wind[0]), float(wind[1])]}
+                       'wind': [float(wind[0]), float(wind[1])], 'billow': float(billow),
+                       'wind_speed': [float(wind_speed[0]), float(wind_speed[1])],
+                       'billow_speed': float(billow_speed)}
         self._sync_cloud_fields()
+        # (Re-)anchor the drift/billow animation (see sample_cloud_drift) to
+        # the wind/billow POSITION this call just set. set_clouds is the one
+        # place every cloud change funnels through -- a fresh scene, a
+        # reloaded one, or the F5 menu tweaking some unrelated cloud slider
+        # (which re-spreads the whole tracer.clouds dict back through here)
+        # -- so anchoring here, instead of only in set_cloud_drift, means a
+        # reloaded scene resumes animating from its saved position instead
+        # of snapping back to 0, and an unrelated menu edit doesn't reset
+        # the animation's clock either.
+        self._cloud_wind_base = tuple(self.clouds['wind'])
+        self._cloud_billow_base = float(self.clouds['billow'])
+        self._cloud_drift_t0 = None  # re-anchored on the next sample_cloud_drift call
         self.reset_accumulation()
         return self
 
@@ -4579,13 +4621,89 @@ class RayTracer:
         """Updates just the wind offset (see set_clouds) without touching
         any other cloud parameter or resetting the whole config -- the
         cheap call to make from a per-frame animation loop / render_video
-        for slowly drifting clouds. No effect if set_clouds hasn't been
-        called."""
+        for slowly drifting clouds sideways. No effect if set_clouds hasn't
+        been called. See set_cloud_billow for the complementary "shapes
+        actually change" axis, or set_cloud_drift for both at once."""
         if self.clouds is None:
             return
         self.clouds['wind'] = [float(wind[0]), float(wind[1])]
         CLOUD_WIND[None] = list(self.clouds['wind'])
         self.reset_accumulation()
+
+    def set_cloud_billow(self, billow):
+        """Updates just the billow offset (see set_clouds) without touching
+        any other cloud parameter -- the cheap call to make from a
+        per-frame animation loop / render_video to make cloud shapes churn/
+        morph over time (as opposed to set_cloud_wind, which slides the
+        same rigid shapes sideways). No effect if set_clouds hasn't been
+        called."""
+        if self.clouds is None:
+            return
+        self.clouds['billow'] = float(billow)
+        CLOUD_TIME[None] = self.clouds['billow']
+        self.reset_accumulation()
+
+    def set_cloud_drift(self, wind_speed=(0.0, 0.0), billow_speed=0.0):
+        """Configures continuous cloud animation: (x, z) wind_speed (world
+        units/second) drifts the cloud shapes sideways over time; billow_speed
+        (units/second) instead makes the puffs churn/swell/merge, rather than
+        just translate (see set_clouds' docstring for why they look
+        different). Stores both ON tracer.clouds -- via set_clouds, which
+        also (re-)anchors the animation to the CURRENT wind/billow position
+        -- so they save/reload with the rest of the cloud config instead of
+        being lost as transient state. Call sample_cloud_drift(t) once per
+        frame to actually apply it. A gentle real-world-ish look is usually
+        a slow wind_speed (a few world units/second, in whatever direction
+        you want the weather moving) plus a much smaller billow_speed
+        (shapes evolving is a slower, subtler effect than drifting across
+        the sky). No effect if set_clouds hasn't been called."""
+        if self.clouds is None:
+            return self
+        return self.set_clouds(**{**self.clouds, 'wind_speed': wind_speed, 'billow_speed': billow_speed})
+
+    def sample_cloud_drift(self, t, reset=True):
+        """Applies the drift/billow speeds configured by set_cloud_drift (or
+        loaded from a scene file -- see set_clouds) at absolute time `t`
+        (seconds): wind = base + wind_speed * elapsed, billow = base +
+        billow_speed * elapsed, where `base` is the wind/billow POSITION
+        set_clouds last anchored to and `elapsed` is measured from whatever
+        `t` was passed on the FIRST call after that anchor -- so the
+        interactive view can pass wall-clock time.time() and render_video
+        can pass each frame's exact (sub-frame-shutter-aware) sample
+        timestamp, the same way spotlight animations and water-ripple time
+        already work in this file, and either way the very first call after
+        an anchor is a no-op offset rather than a jump.
+
+        reset: whether to also call reset_accumulation() here. Leave this
+        True for the interactive view (the default). Pass False when
+        sampling repeatedly WITHIN one already-reset frame -- e.g.
+        render_video's motion-blur sub-frame loop, which calls this once
+        per shutter subsample and relies on those subsamples ACCUMULATING
+        together (that's what makes the blur); resetting on every one of
+        them would wipe out everything but the last subsample instead.
+
+        Returns True if anything actually changed, so callers can OR it
+        into their `any_input`/reset-accumulation flag -- same as any other
+        animated element (spotlights, stars). No-op (returns False) if
+        clouds are disabled or wind_speed/billow_speed are both zero."""
+        if self.clouds is None or not self.clouds.get('enabled'):
+            return False
+        wx, wz = self.clouds.get('wind_speed', (0.0, 0.0))
+        bs = self.clouds.get('billow_speed', 0.0)
+        if wx == 0.0 and wz == 0.0 and bs == 0.0:
+            return False
+        if getattr(self, '_cloud_drift_t0', None) is None:
+            self._cloud_drift_t0 = t
+        elapsed = t - self._cloud_drift_t0
+        wind_base = getattr(self, '_cloud_wind_base', tuple(self.clouds['wind']))
+        billow_base = getattr(self, '_cloud_billow_base', self.clouds.get('billow', 0.0))
+        self.clouds['wind'] = [float(wind_base[0] + wx * elapsed), float(wind_base[1] + wz * elapsed)]
+        self.clouds['billow'] = float(billow_base + bs * elapsed)
+        CLOUD_WIND[None] = list(self.clouds['wind'])
+        CLOUD_TIME[None] = self.clouds['billow']
+        if reset:
+            self.reset_accumulation()
+        return True
 
     def _sync_cloud_fields(self):
         """Uploads self.clouds (see set_clouds) to the CLOUD_* GPU fields,
@@ -4604,6 +4722,7 @@ class RayTracer:
         CLOUD_SCALE[None] = c['scale']
         CLOUD_COLOR[None] = [ch / 255.0 for ch in c['color']]
         CLOUD_WIND[None] = list(c['wind'])
+        CLOUD_TIME[None] = c.get('billow', 0.0)
         CLOUD_STEPS[None] = c['steps']
         CLOUD_LIGHT_STEPS[None] = c['light_steps']
         sun = self.background.sun
@@ -5047,6 +5166,14 @@ class RayTracer:
                         # spotlight motion-blurs consistently with the
                         # camera instead of jumping once per whole frame.
                         self.set_spotlight_animation_time(tt)
+                        # Same idea for cloud drift/billow (see
+                        # set_cloud_drift/sample_cloud_drift) -- sampled at
+                        # the exact sub-frame timestamp `tt`, not wall-clock,
+                        # so drifting/billowing clouds motion-blur correctly
+                        # and the video is reproducible regardless of how
+                        # fast the machine renders it.
+                        if self.clouds is not None:
+                            self.sample_cloud_drift(tt, reset=False)
                         self.add_samples(1)
                 else:
                     pos, q = camera_path.sample_quat(t_center)
@@ -5058,6 +5185,11 @@ class RayTracer:
                     # interactive view, so re-rendering the same video is
                     # reproducible regardless of how fast the machine runs.
                     self.set_spotlight_animation_time(t_center)
+                    # Same determinism story for cloud drift/billow. reset=
+                    # False -- the per-frame reset_accumulation() already
+                    # happened above, before this frame's block started.
+                    if self.clouds is not None:
+                        self.sample_cloud_drift(t_center, reset=False)
                     self.add_samples(samples_per_frame)
 
                 if do_eye_adapt:
@@ -7865,6 +7997,26 @@ def _build_world_params(tracer, post_fx, camera_path, has_camera_data):
         add("  Cloud thickness", lambda: tracer.clouds['top'] - tracer.clouds['base'],
             lambda v: tracer.set_clouds(**{**tracer.clouds, 'top': tracer.clouds['base'] + max(1.0, v)}),
             'float', 2.0, 1.0, 500.0)
+        # Drift/billow speeds (see set_cloud_drift/sample_cloud_drift) --
+        # wind_speed slides the whole cloud layer sideways, billow_speed
+        # instead makes the puffs themselves churn/morph over time. These
+        # now live on tracer.clouds itself (alongside 'wind'/'billow', the
+        # CURRENT drifted position) so they save/reload with the rest of
+        # the cloud config -- see set_clouds.
+        add("  Wind speed X", lambda: tracer.clouds.get('wind_speed', (0.0, 0.0))[0],
+            lambda v: tracer.set_cloud_drift(
+                wind_speed=(v, tracer.clouds.get('wind_speed', (0.0, 0.0))[1]),
+                billow_speed=tracer.clouds.get('billow_speed', 0.0)),
+            'float', 0.2, -50.0, 50.0)
+        add("  Wind speed Z", lambda: tracer.clouds.get('wind_speed', (0.0, 0.0))[1],
+            lambda v: tracer.set_cloud_drift(
+                wind_speed=(tracer.clouds.get('wind_speed', (0.0, 0.0))[0], v),
+                billow_speed=tracer.clouds.get('billow_speed', 0.0)),
+            'float', 0.2, -50.0, 50.0)
+        add("  Billow speed", lambda: tracer.clouds.get('billow_speed', 0.0),
+            lambda v: tracer.set_cloud_drift(
+                wind_speed=tracer.clouds.get('wind_speed', (0.0, 0.0)), billow_speed=v),
+            'float', 0.05, -10.0, 10.0)
 
     add("[C] Caustics enabled", lambda: tracer.caustics_enabled,
         lambda v: setattr(tracer, 'caustics_enabled', v), 'bool')
@@ -8535,7 +8687,7 @@ def main(argv=None):
             horizon_color=(35, 55, 85),
             ground_color=(10, 12, 18),
             curve=0.4,
-            resolution=(800, 400)
+            resolution=(2000, 1000)
         )
         lights = [
             #Light((-18.41, 29.48, -12.73), (255, 251, 235), 1.1),   # key light, slightly warm
@@ -9388,6 +9540,12 @@ def main(argv=None):
         # call unconditionally -- it's a no-op for any spotlight that
         # doesn't have one attached.
         if tracer.spotlights and tracer.update_spotlight_animations(frame_dt):
+            any_input = True
+
+        # Cloud drift/billow (see set_cloud_drift/sample_cloud_drift):
+        # wall-clock-driven here, same as spotlight animations above --
+        # a no-op unless set_cloud_drift was called with a nonzero speed.
+        if tracer.clouds is not None and tracer.sample_cloud_drift(now_t):
             any_input = True
 
         # Star twinkle: throttled (see RayTracer.update_stars' docstring
