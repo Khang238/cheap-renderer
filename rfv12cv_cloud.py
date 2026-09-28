@@ -564,6 +564,12 @@ KEY_HOLD_WINDOW = 0.20   # seconds -- see the module docstring: a key counts as 
 # interactive/live view responsive; final renders still use the scene's
 # own (higher-quality) max_bounce.
 LIVE_MAX_BOUNCE = 3
+CUTOUT_TUNNEL_BUDGET = 48  # extra loop iterations (beyond max_bounce) reserved purely for
+                           # passing through alpha-cutout pixels -- see render_sample's
+                           # real_bounce counter. Needs to comfortably cover the messiest
+                           # case (a ray grazing along several overlapping RGBA sprite edges,
+                           # e.g. wispy hair strands) without ever being mistaken for real
+                           # reflect/refract bounces.
 DEFAULT_MAX_BOUNCE = 8  # sane default for RayTracer(max_bounce=...) if not overridden
 
 # --- VIDEO (camera keyframe path -> render video, Shift+Enter) ---------
@@ -1330,7 +1336,20 @@ class Background:
     def _paint_sun(self):
         """Paints the current self.sun disc onto self.image (assumes the
         caller, _repaint, has already reset self.image to the clean
-        base)."""
+        base).
+
+        Three layers, each softer/wider than the last: a limb-darkened
+        disc (brighter at its center, dimming gently toward the edge --
+        the way the real sun's photosphere looks, rather than a flat
+        cutout), a tight bright corona right at its edge, and a much
+        wider, faint atmospheric halo (real haze scatters sunlight across
+        a big patch of sky, not just a thin ring). Every pixel that could
+        be touched is supersampled on a small sub-pixel grid rather than
+        tested once at its center, so the whole shape is anti-aliased and
+        actually responds smoothly to angular_size_deg/glow_deg even when
+        the disc itself is only a few pixels across (see
+        _sample_background's docstring for why that matters at this
+        texture's resolution)."""
         if self._sky_base_image is None or self.sun is None or not self.sun_enabled:
             return
         s = self.sun
@@ -1351,21 +1370,47 @@ class Background:
         col = (np.array(s['color'][:3], dtype=np.float32) / 255.0) * s['intensity']
         disc_r = max(0.5, s['angular_size_deg'] / 180.0 * h)   # h spans 180 degrees, top to bottom
         glow_r = disc_r + max(0.0, s['glow_deg'] / 180.0 * h)
-        pad = int(math.ceil(glow_r)) + 1
+        halo_r = glow_r + max(disc_r, glow_r) * 1.5
+        SS = 4  # sub-samples per axis per pixel (16 total) -- see docstring
+        offs = [(k + 0.5) / SS - 0.5 for k in range(SS)]
+        n_sub = float(SS * SS)
+        pad = int(math.ceil(halo_r)) + 1
         y0, y1 = max(0, int(cy) - pad), min(h, int(cy) + pad + 1)
         for iy in range(y0, y1):
-            dyp = iy - cy
             for ixo in range(-pad, pad + 1):
-                dist = math.sqrt(ixo * ixo + dyp * dyp)
-                if dist > glow_r:
-                    continue
                 ix = (int(cx) + ixo) % w  # wraps around the horizon (azimuth 360 == 0)
-                if dist <= disc_r:
-                    self.image[iy, ix] = col
-                else:
-                    t = 1.0 - (dist - disc_r) / max(1e-4, glow_r - disc_r)
-                    t = t * t
-                    self.image[iy, ix] = self.image[iy, ix] * (1.0 - t) + col * t
+                disc_acc = 0.0
+                limb_acc = 0.0
+                glow_acc = 0.0
+                for soy in offs:
+                    dyp = (iy + soy) - cy
+                    for sox in offs:
+                        dxp = (int(cx) + ixo + sox) - cx
+                        dist = math.sqrt(dxp * dxp + dyp * dyp)
+                        if dist <= disc_r:
+                            disc_acc += 1.0
+                            # Cheap limb-darkening approximation (Eddington
+                            # -style): full brightness at the center,
+                            # fading toward the rim.
+                            r_norm = dist / disc_r
+                            limb_acc += 1.0 - 0.45 * (1.0 - math.sqrt(max(0.0, 1.0 - r_norm * r_norm)))
+                        elif dist <= glow_r:
+                            t = 1.0 - (dist - disc_r) / max(1e-4, glow_r - disc_r)
+                            glow_acc += t * t * (3.0 - 2.0 * t)  # smoothstep -- no seam at the disc edge
+                        elif dist <= halo_r:
+                            t = 1.0 - (dist - glow_r) / max(1e-4, halo_r - glow_r)
+                            glow_acc += t * t * 0.18  # far fainter, wide atmospheric halo
+                if disc_acc <= 0.0 and glow_acc <= 0.0:
+                    continue
+                disc_cov = disc_acc / n_sub
+                glow_cov = min(1.0, glow_acc / n_sub)
+                limb = (limb_acc / disc_acc) if disc_acc > 0.0 else 1.0
+                cur = self.image[iy, ix]
+                if disc_cov > 0.0:
+                    cur = cur * (1.0 - disc_cov) + (col * limb) * disc_cov
+                if glow_cov > 0.0:
+                    cur = cur * (1.0 - glow_cov) + col * glow_cov
+                self.image[iy, ix] = cur
 
     def _repaint(self, star_time=0.0):
         """Rebuilds self.image from _sky_base_image + the current sun (if
@@ -2035,14 +2080,40 @@ def _bvh_closest_hit(ro: vec3, rd: vec3, tmax_in: ti.f32):
 
 @ti.func
 def _sample_background(direction: vec3) -> vec3:
+    # Bilinear (not nearest-pixel) lookup. The sky texture is only a few
+    # hundred texels across (see Background.set_sky_gradient's default
+    # 384x192), so nearest-neighbor sampling turns any small baked-in
+    # feature -- most visibly the sun disc from Background._paint_sun --
+    # into hard, blocky steps in the final render, and makes fine
+    # adjustments to its angular_size_deg/glow_deg invisible unless they
+    # happen to cross a whole-texel boundary. Bilinear filtering (wrapping
+    # horizontally across the azimuth seam, clamping vertically at the
+    # poles) turns that into a smooth gradient instead, so the sun/cloud
+    # backdrop actually looks round and responds continuously to its
+    # parameters.
     h = BG_FIELD.shape[0]; w = BG_FIELD.shape[1]
     dx = direction[0]; dy = direction[1]; dz = direction[2]
     u = (ti.atan2(dx, dz) / (2.0 * math.pi)) % 1.0
     v = 1.0 - (ti.asin(ti.max(-1.0, ti.min(1.0, dy))) / math.pi + 0.5)
-    iy = int(ti.max(0.0, ti.min(float(h - 1), v * (h - 1))))
-    ix = int(ti.max(0.0, ti.min(float(w - 1), u * (w - 1))))
-    px = BG_FIELD[iy, ix]
-    return vec3(px[0], px[1], px[2])
+    fx = u * w - 0.5
+    fy = ti.max(0.0, ti.min(float(h - 1), v * (h - 1)))
+    ix0 = int(ti.floor(fx))
+    iy0 = int(ti.floor(fy))
+    tx = fx - float(ix0)
+    ty = fy - float(iy0)
+    ix0w = ix0 % w
+    if ix0w < 0:
+        ix0w += w
+    ix1w = (ix0w + 1) % w
+    iy0c = int(ti.max(0.0, ti.min(float(h - 1), float(iy0))))
+    iy1c = int(ti.max(0.0, ti.min(float(h - 1), float(iy0 + 1))))
+    c00 = BG_FIELD[iy0c, ix0w]
+    c10 = BG_FIELD[iy0c, ix1w]
+    c01 = BG_FIELD[iy1c, ix0w]
+    c11 = BG_FIELD[iy1c, ix1w]
+    top = vec3(c00[0], c00[1], c00[2]) * (1.0 - tx) + vec3(c10[0], c10[1], c10[2]) * tx
+    bot = vec3(c01[0], c01[1], c01[2]) * (1.0 - tx) + vec3(c11[0], c11[1], c11[2]) * tx
+    return top * (1.0 - ty) + bot * ty
 
 
 @ti.func
@@ -2201,18 +2272,25 @@ def _cloud_fbm(p: vec3) -> ti.f32:
 
 @ti.func
 def _cloud_density(p: vec3) -> ti.f32:
-    # Zero outside [CLOUD_BASE, CLOUD_TOP], with a soft fade-in/out near
-    # each edge (rather than a hard cutoff) so the layer doesn't look like
-    # a slab sliced off flat top and bottom.
+    # Zero outside [CLOUD_BASE, CLOUD_TOP]. Real cumulus-style clouds have
+    # a noticeably flatter, SHARPER-edged base (moisture condenses at a
+    # fairly consistent altitude, so the underside is comparatively crisp)
+    # and a softer, rounder, more billowing TOP -- so, unlike a symmetric
+    # fade, the bottom clears over a short band while the top eases out
+    # over a much taller one. That asymmetry alone reads as "cloud" far
+    # more than a slab with the same blur on both edges.
     base = CLOUD_BASE[None]
     top = CLOUD_TOP[None]
     thickness = ti.max(1e-3, top - base)
-    edge = ti.min(thickness * 0.3, 8.0)
+    bottom_edge = ti.min(thickness * 0.12, 4.0)
+    top_edge = ti.min(thickness * 0.45, 14.0)
     y = p[1]
     vert = 0.0
     if base <= y <= top:
-        vert = ti.min(1.0, (y - base) / ti.max(1e-3, edge)) * \
-               ti.min(1.0, (top - y) / ti.max(1e-3, edge))
+        bottom_fade = ti.min(1.0, (y - base) / ti.max(1e-3, bottom_edge))
+        top_t = ti.min(1.0, (top - y) / ti.max(1e-3, top_edge))
+        top_fade = top_t * top_t * (3.0 - 2.0 * top_t)  # smoothstep -- rounds the billowing top
+        vert = bottom_fade * top_fade
     d = 0.0
     if vert > 0.0:
         scale = 1.0 / ti.max(1e-3, CLOUD_SCALE[None])
@@ -2229,8 +2307,20 @@ def _cloud_density(p: vec3) -> ti.f32:
         # `coverage` (0..1) raises/lowers how much of the noise has to
         # clear before it counts as any density at all -- low coverage =
         # mostly clear sky with a few dense puffs, high coverage = a
-        # solid overcast sheet.
-        shaped = ti.max(0.0, n - (1.0 - CLOUD_COVERAGE[None]))
+        # solid overcast sheet. Smoothstepped (instead of a bare linear
+        # ramp) so each puff rounds off softly at its own boundary rather
+        # than showing the noise field's raw linear gradient.
+        raw = ti.max(0.0, n - (1.0 - CLOUD_COVERAGE[None]))
+        shaped = raw * raw * (3.0 - 2.0 * raw)
+        # A second, higher-frequency noise sample "erodes" fine detail
+        # into the shape -- without this every puff is a perfectly smooth
+        # blob, which is the single biggest tell that it's a raw noise
+        # field rather than an actual cloud. Deliberately just one extra
+        # octave (cheap) at a higher frequency, offset well away from the
+        # base sample so it doesn't just look like the same shape zoomed
+        # in.
+        detail = _value_noise3(wp * 4.3 + vec3(19.1, 7.7, 53.3))
+        shaped *= (0.55 + 0.45 * detail)
         d = shaped * vert * CLOUD_DENSITY[None]
     return d
 
@@ -2282,6 +2372,16 @@ def _cloud_march(ro: vec3, rd: vec3, tmax: ti.f32):
         light_steps = CLOUD_LIGHT_STEPS[None]
         light_dir = CLOUD_SUN_DIR[None]
         cloud_col = CLOUD_COLOR[None]
+        # How directly this ray looks toward the sun -- rd and light_dir
+        # are both fixed for the whole march, so this is computed once
+        # rather than inside the per-step loop below. Used for the
+        # silver-lining boost: real clouds scatter light strongly FORWARD
+        # (the Mie/Henyey-Greenstein forward lobe), which is why a cloud
+        # sitting between you and the sun gets a bright glowing edge
+        # instead of just reading as a dim silhouette.
+        forward = ti.max(0.0, rd[0] * light_dir[0] + rd[1] * light_dir[1] + rd[2] * light_dir[2])
+        fw2 = forward * forward
+        fw8 = fw2 * fw2 * fw2 * fw2
         for _ in range(steps):
             if transmittance > 1e-3:
                 p = ro + rd * t
@@ -2289,7 +2389,25 @@ def _cloud_march(ro: vec3, rd: vec3, tmax: ti.f32):
                 if dens > 1e-4:
                     step_optical = dens * seg
                     step_transmit = ti.exp(-step_optical)
-                    light_seg = ti.max(1e-3, CLOUD_TOP[None] - CLOUD_BASE[None]) / light_steps
+                    # Distance from THIS point to the slab's top along the
+                    # light direction -- NOT a fixed CLOUD_TOP-CLOUD_BASE
+                    # (that's only correct when the sun sits straight
+                    # overhead; at any other elevation the true path length
+                    # through the layer is longer, exactly like a shadow
+                    # raymarch through a horizontal fog slab -- see
+                    # _cloud_shadow_transmittance/_cloud_slab_interval,
+                    # which get this right for the GROUND shadow. Without
+                    # this, self-shadowing was badly underestimated for any
+                    # non-vertical sun, so every puff came out nearly
+                    # uniformly lit -- no top/bottom contrast -- which reads
+                    # as a flat, evenly-toned sheet instead of a volumetric
+                    # cloud. Clamp the vertical component so a
+                    # near-horizontal or below-horizon light doesn't blow
+                    # this up (or flip sign) -- it just gets the longest,
+                    # darkest march instead, which is the physically right
+                    # direction for a grazing sun angle.
+                    light_dy = ti.max(0.05, light_dir[1])
+                    light_seg = ti.max(1e-3, (CLOUD_TOP[None] - p[1]) / light_dy) / light_steps
                     light_optical = 0.0
                     lt = light_seg * 0.5
                     for _l in range(light_steps):
@@ -2300,6 +2418,11 @@ def _cloud_march(ro: vec3, rd: vec3, tmax: ti.f32):
                     # still gets some ambient sky-bounce light, real clouds
                     # are never lit purely from one direction.
                     lit_color = cloud_col * (0.35 + 0.65 * light_transmit)
+                    # Silver lining, scaled by light_transmit so it's
+                    # strongest at thin, sunlit patches (little
+                    # self-shadowing) rather than washing out a thick
+                    # cloud's fully-shadowed core into a flat glow.
+                    lit_color += cloud_col * (fw8 * light_transmit * 1.8)
                     scattered += transmittance * (1.0 - step_transmit) * lit_color
                     transmittance *= step_transmit
             t += seg
@@ -2780,8 +2903,22 @@ def render_sample(
         depth_written = False
         primary_dir = ray_dir   # saved before the bounce loop mutates ray_dir (reflections) --
         primary_t = 1.0e18      # see the cloud composite after the loop, below
+        real_bounce = 0         # counts actual optical events (reflect/refract) ONLY -- see
+                                 # the tex_alpha branch below for why this has to be separate
+                                 # from the `bounce` loop variable.
 
-        for bounce in range(max_bounce + 1):
+        # The loop's own trip count is max_bounce PLUS a separate, generous
+        # allowance for alpha-cutout pixels (see tex_alpha branch below): a
+        # ray tunnelling through a transparent PNG's cutout regions (hair
+        # strands, foliage, a sprite's edges) doesn't perform an optical
+        # bounce and must NOT spend the real reflect/refract budget --
+        # without this, a ray that has to pass through even a couple of
+        # cutout pixels before reaching a glass/water surface behind them
+        # could arrive with no real bounces left, making that glass/water
+        # silently render as if it weren't there (see real_bounce checks
+        # below, which gate on the SEPARATE real_bounce counter instead of
+        # this loop's `bounce`).
+        for bounce in range(max_bounce + 1 + CUTOUT_TUNNEL_BUDGET):
             if terminated:
                 continue
             tid, t, bu, bv = _bvh_closest_hit(ray_o, ray_dir, 1e18)
@@ -2840,7 +2977,7 @@ def render_sample(
 
             if transp > 0.0:
                 # --- Dielectric material (glass): random Fresnel split --- (unchanged from v7/v8)
-                if bounce >= max_bounce:
+                if real_bounce >= max_bounce:
                     final_color += throughput * _sample_background(ray_dir) * bg_brightness
                     terminated = True
                     continue
@@ -2872,6 +3009,7 @@ def render_sample(
                     ray_dir = rdir
                     throughput /= (1.0 - p_reflect)
 
+                real_bounce += 1
                 if throughput.max() < 1e-3:
                     terminated = True
 
@@ -2946,18 +3084,26 @@ def render_sample(
                 # single-sample fireflies blowing up the accumulation buffer.
                 local = ti.max(0.0, ti.min(12.0, local))
 
-                if refl_k > 0.0:
+                if refl_k > 0.0 and real_bounce < max_bounce:
                     final_color += throughput * (1.0 - refl_k) * local
                     throughput = throughput * col * refl_k
                     ns = _perturb_in_cone(n, rough)
                     rdir = (ray_dir - 2.0 * ray_dir.dot(ns) * ns).normalized()
                     ray_o = p + n * 1e-3
                     ray_dir = rdir
+                    real_bounce += 1
                     if throughput.max() < 1e-3:
                         terminated = True
                 else:
                     final_color += throughput * local
                     terminated = True
+
+        if not terminated:
+            # Practically never hit -- would need a ray to tunnel through
+            # CUTOUT_TUNNEL_BUDGET alpha-cutout pixels in a row without ever
+            # reaching real geometry. Falls back to background instead of
+            # silently contributing black, the same as the tid < 0 case above.
+            final_color += throughput * _sample_background(ray_dir) * bg_brightness
 
         if CLOUD_ENABLED[None] != 0:
             # Composited once per pixel/sample against the PRIMARY ray only
@@ -4238,7 +4384,7 @@ class RayTracer:
         # twinkle (seconds). 0 disables the update entirely, freezing the
         # field as baked -- see update_stars / set_star_update_interval.
         # Previously hard-coded to 1.0 in the interactive loop.
-        self.star_update_interval = 1.0
+        self.star_update_interval = 0.0
         alloc_cloud_fields()
         self._sync_cloud_fields()
 
@@ -5893,22 +6039,44 @@ def apply_depth_of_field(img, depth, focus_distance, blur_strength, max_radius):
 
 
 def apply_chromatic_aberration(img, strength):
+    """Radial R/B channel split. Two fixes vs. the old version:
+      1) BILINEAR resampling (cv2.remap) instead of nearest-neighbor integer
+         indexing -- the old `.astype(np.int32)` truncation gave every
+         shifted channel a crisp, un-blended copy of itself, so small bright
+         features (a star, a rim-light highlight) didn't get a soft color
+         fringe, they tore into fully separate red/green/blue dots, and
+         every silhouette edge got a hard double line instead of gentle
+         fringing. That's independent of sample count -- it happens to the
+         final resolved image regardless of how many samples produced it,
+         which is why it doesn't go away no matter how high you push
+         --samples.
+      2) The shift now eases in with an r^2 falloff from screen center
+         instead of scaling linearly across the whole frame. Real lenses
+         show essentially no fringing at the optical center and increasing
+         separation toward the edges/corners; the old linear version gave
+         every pixel a shift proportional to `strength` even a few hundred
+         pixels from center, which is why content near the middle of frame
+         (like a subject's face) showed just as much splitting as the
+         corners."""
     if strength <= 0:
         return img
     h, w = img.shape[:2]
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
     cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+    r_max = math.sqrt(cx * cx + cy * cy)
+    r_norm = np.clip(np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) / max(r_max, 1e-6), 0.0, 1.0)
+    falloff = r_norm * r_norm  # 0 at center, 1 at the corners
 
-    def sample(channel, scale):
-        sx = cx + (xx - cx) * scale
-        sy = cy + (yy - cy) * scale
-        sx = np.clip(sx, 0, w - 1).astype(np.int32)
-        sy = np.clip(sy, 0, h - 1).astype(np.int32)
-        return channel[sy, sx]
+    def sample(channel, sign):
+        local_strength = strength * sign * falloff
+        sx = (cx + (xx - cx) * (1.0 + local_strength)).astype(np.float32)
+        sy = (cy + (yy - cy) * (1.0 + local_strength)).astype(np.float32)
+        return cv2.remap(channel.astype(np.float32), sx, sy,
+                          interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
-    r = sample(img[..., 0], 1.0 + strength)
+    r = sample(img[..., 0], 1.0)
     g = img[..., 1]
-    b = sample(img[..., 2], 1.0 - strength)
+    b = sample(img[..., 2], -1.0)
     return np.stack([r, g, b], axis=-1)
 
 
@@ -5968,6 +6136,29 @@ def apply_lens_flare(img, flares, flare_size, flare_intensity, anamorphic=0.0, h
     return out
 
 
+def _flare_brightness_curve(b):
+    """Soft-compresses a light's raw `brightness` before it drives the
+    lens-flare/god-ray post-effects. Those effects are ADDITIVE on top of
+    the already-resolved, already-ACES-tonemapped image (see
+    apply_post_processing -> apply_lens_flare/apply_god_rays, both called
+    after resolve_output), so unlike a surface's own shading -- which gets
+    a graceful filmic highlight rolloff from render_sample/resolve_output --
+    a raw, uncompressed brightness fed straight into the flare's glow/ghost/
+    anamorphic-streak/halo intensities scales them linearly and without any
+    ceiling. A sun/moon light in particular tends to carry a large
+    brightness on purpose (point lights here have no distance falloff, see
+    add_sun_light's docstring, so it needs enough of it to actually
+    illuminate the scene from far away) -- fed raw into the flare, that
+    turns into a huge, hard-edged, "supernova" blowout instead of a
+    tasteful glow, for any strong light, sun/moon or otherwise. This caps
+    how large a flare's contribution can ever get (saturating toward 3.0x)
+    while staying close to linear for more modest brightness values, so
+    ordinary point/spot lights still look proportionate to how bright they
+    actually are."""
+    b = max(0.0, b)
+    return 3.0 * b / (3.0 + b)
+
+
 def compute_flare_list(tracer: RayTracer, camera_pos, R):
     """Projects each light onto the screen + checks occlusion (a single BVH
     ray from the camera to the light), returns a list usable by apply_lens_flare()."""
@@ -5989,7 +6180,7 @@ def compute_flare_list(tracer: RayTracer, camera_pos, R):
         sx = (xc / (zc * tracer.half_tan * tracer.aspect)) * hw + hw
         sy = (-yc / (zc * tracer.half_tan)) * hh + hh
         if -0.2 * tracer.width <= sx <= 1.2 * tracer.width and -0.2 * tracer.height <= sy <= 1.2 * tracer.height:
-            flares.append((sx, sy, tuple(lt.color), lt.brightness))
+            flares.append((sx, sy, tuple(lt.color), _flare_brightness_curve(lt.brightness)))
 
     if tracer.spotlights:
         compute_spot_visibility(float(camera_pos[0]), float(camera_pos[1]),
@@ -6013,7 +6204,7 @@ def compute_flare_list(tracer: RayTracer, camera_pos, R):
             sx = (xc / (zc * tracer.half_tan * tracer.aspect)) * hw + hw
             sy = (-yc / (zc * tracer.half_tan)) * hh + hh
             if -0.2 * tracer.width <= sx <= 1.2 * tracer.width and -0.2 * tracer.height <= sy <= 1.2 * tracer.height:
-                flares.append((sx, sy, tuple(sl.color), sl.brightness * 0.8))
+                flares.append((sx, sy, tuple(sl.color), _flare_brightness_curve(sl.brightness * 0.8)))
     return flares
 
 
@@ -7207,7 +7398,7 @@ def load_scene_file(path):
         'zoom_speed': float(data.get('zoom_speed', 1.0)),
         'zoom_min': float(data.get('zoom_min', 1.0)),
         'zoom_max': float(data.get('zoom_max', 8.0)),
-        'star_update_interval': float(data.get('star_update_interval', 1.0)),
+        'star_update_interval': float(data.get('star_update_interval', 0.0)),
         'sun_light_index': data.get('sun_light_index'),
     }
 
@@ -8755,7 +8946,7 @@ def main(argv=None):
         clouds_cfg = loaded.get('clouds')
         if clouds_cfg:
             tracer.set_clouds(**clouds_cfg)
-        tracer.set_star_update_interval(loaded.get('star_update_interval', 1.0))
+        tracer.set_star_update_interval(loaded.get('star_update_interval', 0.0))
         tracer.base_fov_deg = float(loaded.get('base_fov_deg', tracer.base_fov_deg))
         tracer.zoom_min = float(loaded.get('zoom_min', tracer.zoom_min))
         tracer.zoom_max = float(loaded.get('zoom_max', tracer.zoom_max))
@@ -9551,7 +9742,7 @@ def main(argv=None):
         # Star twinkle: throttled (see RayTracer.update_stars' docstring
         # for why) rather than advanced every frame -- "occasionally shift
         # slightly", not a strobe. The interval is
-        # tracer.star_update_interval (default 1s, adjustable in the F5
+        # tracer.star_update_interval (default 0s/off, adjustable in the F5
         # menu / --star-update-interval); 0 turns the update off and
         # leaves the field frozen as baked. Skipped entirely while the
         # star field is hidden.
