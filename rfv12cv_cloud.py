@@ -224,6 +224,25 @@ physics/logic from v8, just with comments translated to English.
      that spot, per-frame motion drops from 7.1deg to 3.2deg at
      --inertia 0.3 and 1.8deg at 0.6. Re-exporting the track with more
      decimals is the real fix.
+
+14) FIXES (clouds + alpha cutouts):
+   - Clouds no longer collapse into one flat sheet. Cause: _cloud_march
+     used a uniform step of (slab ray length)/steps, and that length grows
+     like 1/sin(elevation), so near the horizon each step spanned several
+     noise features and averaged them away. Steps are now graded
+     (dense near the camera, coarser far away), the density field gets
+     height-dependent coverage (rounded domes on flat bases), a steeper
+     edge remap with edge-weighted erosion, height-based ambient shading,
+     and a little distance haze. No new parameters; scene files unchanged.
+     Shadows use the same _cloud_density, so ground shadows follow the
+     new shapes.
+   - Glass/water behind an alpha=0 region of an RGBA image is no longer
+     paler. Cause: passing through a cutout pixel moved ray_o to the sprite
+     plane, so the next hit's `t` (used for Beer-Lambert absorption) only
+     measured from that plane. The skipped distance is now carried
+     (carry_t / seg_carry) in render_sample and _shadow_throughput. This
+     also corrects the depth used for DoF and the cloud composite tmax for
+     rays that pass through a cutout first.
 """
 
 import argparse
@@ -2307,11 +2326,26 @@ def _cloud_density(p: vec3) -> ti.f32:
         # `coverage` (0..1) raises/lowers how much of the noise has to
         # clear before it counts as any density at all -- low coverage =
         # mostly clear sky with a few dense puffs, high coverage = a
-        # solid overcast sheet. Smoothstepped (instead of a bare linear
-        # ramp) so each puff rounds off softly at its own boundary rather
-        # than showing the noise field's raw linear gradient.
-        raw = ti.max(0.0, n - (1.0 - CLOUD_COVERAGE[None]))
-        shaped = raw * raw * (3.0 - 2.0 * raw)
+        # solid overcast sheet.
+        #
+        # Two things keep this from reading as ONE flat sheet (the old
+        # `raw*raw*(3-2*raw)` ramp over a fixed threshold did):
+        #  (a) The threshold RISES with height (hfrac 0 at the base ->
+        #      1 at the top): near the base a lot of the noise counts as
+        #      cloud, near the top only its highest peaks do, so each
+        #      puff narrows into a rounded dome on a flat-ish base
+        #      instead of being a full-thickness column of uniform
+        #      density -- that vertical structure is what makes separate
+        #      cumulus read as separate objects.
+        #  (b) A steep gain on the remapped value (saturating at
+        #      raw ~= 0.25) gives each puff a well-defined body with a
+        #      soft but short edge, and clear sky between puffs, instead
+        #      of a wide shallow fade that blends neighbours into haze.
+        hfrac = (y - base) / thickness
+        thr = (1.0 - CLOUD_COVERAGE[None]) - 0.10 + 0.32 * hfrac
+        raw = ti.max(0.0, n - thr)
+        g = ti.min(1.0, raw * 4.0)
+        shaped = g * g * (3.0 - 2.0 * g)
         # A second, higher-frequency noise sample "erodes" fine detail
         # into the shape -- without this every puff is a perfectly smooth
         # blob, which is the single biggest tell that it's a raw noise
@@ -2320,7 +2354,10 @@ def _cloud_density(p: vec3) -> ti.f32:
         # base sample so it doesn't just look like the same shape zoomed
         # in.
         detail = _value_noise3(wp * 4.3 + vec3(19.1, 7.7, 53.3))
-        shaped *= (0.55 + 0.45 * detail)
+        # Erode the EDGES (low `shaped`) harder than the core: subtracting
+        # a detail-driven amount frays the silhouette into cauliflower
+        # lobes while dense interiors stay solid.
+        shaped = ti.min(1.0, ti.max(0.0, shaped - 0.32 * (1.0 - detail)) / 0.86)
         d = shaped * vert * CLOUD_DENSITY[None]
     return d
 
@@ -2365,10 +2402,26 @@ def _cloud_march(ro: vec3, rd: vec3, tmax: ti.f32):
 
     if t1 > t0:
         steps = CLOUD_STEPS[None]
-        seg = (t1 - t0) / steps
-        # A random jitter on the starting offset breaks up the visible
-        # banding a fixed-step march would otherwise leave in thick cloud.
-        t = t0 + seg * ti.random(ti.f32)
+        span = t1 - t0
+        # STEP SPACING. The slab's ray interval grows like 1/sin(elevation):
+        # a ray at 3 degrees crosses a 60-unit slab over ~1100 units, and
+        # the old uniform `span/steps` step was then 45+ units -- as large
+        # as a whole noise feature -- so every step averaged over several
+        # puffs and the layer collapsed into a smooth, featureless sheet
+        # (worst toward the horizon, fine when looking up: hence "sometimes").
+        # Now samples are spaced as t = t0 + span * s^pw (s in 0..1): pw = 1
+        # is the old uniform spacing (used whenever the uniform step is
+        # already fine relative to CLOUD_SCALE), and pw grows up to 3 as the
+        # uniform step gets coarse, packing samples densely near the camera
+        # -- where puffs are big on screen and detail matters -- and
+        # spreading them out over the far part of the slab, where a puff is
+        # a few pixels wide anyway.
+        seg_uniform = span / steps
+        pw = ti.max(1.0, ti.min(3.0, seg_uniform / ti.max(1.0, 0.25 * CLOUD_SCALE[None])))
+        # One random jitter per ray (stratified: each step samples a random
+        # spot inside its own stratum) breaks up the banding a fixed-step
+        # march would leave, and averages out over samples.
+        jit = ti.random(ti.f32)
         light_steps = CLOUD_LIGHT_STEPS[None]
         light_dir = CLOUD_SUN_DIR[None]
         cloud_col = CLOUD_COLOR[None]
@@ -2382,8 +2435,13 @@ def _cloud_march(ro: vec3, rd: vec3, tmax: ti.f32):
         forward = ti.max(0.0, rd[0] * light_dir[0] + rd[1] * light_dir[1] + rd[2] * light_dir[2])
         fw2 = forward * forward
         fw8 = fw2 * fw2 * fw2 * fw2
-        for _ in range(steps):
+        for i in range(steps):
             if transmittance > 1e-3:
+                s_lo = ti.pow(ti.f32(i) / steps, pw)
+                s_hi = ti.pow(ti.f32(i + 1) / steps, pw)
+                s_mid = ti.pow((ti.f32(i) + jit) / steps, pw)
+                seg = span * (s_hi - s_lo)   # this step's own length
+                t = t0 + span * s_mid
                 p = ro + rd * t
                 dens = _cloud_density(p)
                 if dens > 1e-4:
@@ -2417,7 +2475,19 @@ def _cloud_march(ro: vec3, rd: vec3, tmax: ti.f32):
                     # 0.35 floor -- even a fully self-shadowed cloud interior
                     # still gets some ambient sky-bounce light, real clouds
                     # are never lit purely from one direction.
-                    lit_color = cloud_col * (0.35 + 0.65 * light_transmit)
+                    # The 0.35 ambient term also gets brighter with height
+                    # (sky light reaches a puff's top, not its underside),
+                    # which keeps a top/bottom gradient even when the sun
+                    # is behind the cloud or too low to self-shadow much.
+                    hf = ti.min(1.0, ti.max(0.0, (p[1] - CLOUD_BASE[None]) / ti.max(1e-3, CLOUD_TOP[None] - CLOUD_BASE[None])))
+                    lit_color = cloud_col * (0.30 + 0.22 * hf + 0.48 * light_transmit)
+                    # Aerial perspective: very distant puffs (a few pixels
+                    # wide, dozens of them stacked along a grazing ray)
+                    # drift toward an even, bright haze instead of each
+                    # showing its own dark underside, which otherwise turns
+                    # the horizon into a grainy grey band.
+                    haze = 1.0 - ti.exp(-t / ti.max(1.0, CLOUD_SCALE[None] * 40.0))
+                    lit_color = lit_color * (1.0 - haze) + cloud_col * (0.9 * haze)
                     # Silver lining, scaled by light_transmit so it's
                     # strongest at thin, sunlit patches (little
                     # self-shadowing) rather than washing out a thick
@@ -2425,7 +2495,6 @@ def _cloud_march(ro: vec3, rd: vec3, tmax: ti.f32):
                     lit_color += cloud_col * (fw8 * light_transmit * 1.8)
                     scattered += transmittance * (1.0 - step_transmit) * lit_color
                     transmittance *= step_transmit
-            t += seg
     return transmittance, scattered
 
 
@@ -2578,6 +2647,9 @@ def _shadow_throughput(p_from: vec3, light_pos: vec3) -> vec3:
     throughput = vec3(1.0)
     ro = p_from
     travelled = 0.0
+    seg_carry = 0.0   # distance skipped through transparent-PNG pixels since the last
+                      # real occluder -- added back to `t` so Beer-Lambert absorption
+                      # through glass isn't shortened by an image plane in front of it
 
     if CLOUD_ENABLED[None] != 0:
         # This is the actual "clouds cast shadows on objects" mechanism --
@@ -2621,9 +2693,13 @@ def _shadow_throughput(p_from: vec3, light_pos: vec3) -> vec3:
             step = t + 1e-3
             ro = ro + ldir * step
             travelled += step
+            seg_carry += step
             if travelled >= light_dist:
                 break
             continue  # jump to the next iteration to look for another occluder behind it
+
+        t = t + seg_carry
+        seg_carry = 0.0
 
         # --- HANDLE A NORMAL OCCLUDER (glass or an opaque object) ---
         if transp <= 0.0:
@@ -2906,6 +2982,16 @@ def render_sample(
         real_bounce = 0         # counts actual optical events (reflect/refract) ONLY -- see
                                  # the tex_alpha branch below for why this has to be separate
                                  # from the `bounce` loop variable.
+        # Distance already travelled since the ray's last REAL origin (camera,
+        # or the last reflect/refract event) but "spent" skipping through
+        # alpha-cutout pixels. Each cutout hit moves ray_o forward to the
+        # sprite plane, so the next hit's `t` only measures from THAT plane;
+        # without adding this back, Beer-Lambert absorption (which depends on
+        # path length) and the depth used for DoF/clouds were computed from
+        # the sprite plane instead of the true origin -- glass sitting behind
+        # a see-through part of an RGBA image came out visibly paler/less
+        # tinted than the same glass with nothing in front of it.
+        carry_t = 0.0
 
         # The loop's own trip count is max_bounce PLUS a separate, generous
         # allowance for alpha-cutout pixels (see tex_alpha branch below): a
@@ -2959,7 +3045,13 @@ def render_sample(
                 # "in focus" even though the color actually shown there
                 # comes from something far behind it.
                 ray_o = p + ray_dir * 1e-3
+                carry_t += t + 1e-3   # remember the distance we just skipped over
                 continue  # move on to the next bounce without stopping the ray here
+
+            # A real (non-cutout) surface: the true path length since the last
+            # real origin is the skipped cutout distance PLUS this segment.
+            t = t + carry_t
+            carry_t = 0.0
 
             if not depth_written:
                 DEPTH_ACCUM[py, px] += t
