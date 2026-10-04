@@ -188,6 +188,24 @@ physics/logic from v8, just with comments translated to English.
    of the star rows hanging off "Sky light" as though they belonged to
    it.
 
+11b) VIDEO PLANES + EMISSIVE (SELF-ILLUMINATED) MATERIALS.
+   Scene.add_video(center, (w, h|None), "clip.mp4") adds a plane that plays a
+   looping video (decoded with cv2, audio ignored; h=None takes the video's
+   aspect ratio). All video planes share one clock: SPACE pauses/plays them in
+   the live view (the F5 menu has the same toggle); --headless --video plays
+   them automatically from t=0 along the output timeline (also with parallel
+   frame blocks and motion blur -- playback is a pure function of time);
+   stills show --video-time T. --video-start-paused opens the live view paused.
+   Video frames are resized to TextureLibrary.TEX_SIZE (--texture-size) squared.
+   emissive=/emissive_color=/unlit= on add_box/add_image/add_video: emissive is a
+   glow strength (0 = off), emissive_color overrides the glow colour (default =
+   the surface's own colour/texture/video frame), unlit ignores scene lighting.
+   Emissive faces also act as AREA LIGHTS (one power-weighted light sample +
+   shadow ray per shaded point, only paid when the scene has emitters), so a
+   screen tints the room with its picture. --no-emissive-light, or
+   tracer.emissive_lighting_enabled / emissive_light_strength (F5 menu), keep
+   the glow but drop the lighting. Scene export embeds video files.
+
 12) SCENE EXPORT (X key / --export-scene) IS COMPLETE. save_scene_file
    additionally writes the volumetric cloud layer, the full optical-zoom
    state (base_fov_deg/zoom/zoom_target/zoom_speed/zoom_min/zoom_max),
@@ -562,7 +580,7 @@ def normalize(v):
 #    doesn't need to thread resolution through every function signature).
 # =============================================================================
 
-PREVIEW_RES = (640, 360)         # window size + 2D painter's-algorithm preview
+PREVIEW_RES = (960, 540)         # window size + 2D painter's-algorithm preview
 LIVE_RENDER_RES = (96, 54)       # interactive raytrace resolution (upscaled to window)
 FINAL_RENDER_RES = (3840, 2160)  # final image (the '9' key), saved to file
 MAX_W, MAX_H = FINAL_RENDER_RES
@@ -646,6 +664,15 @@ CAUSTIC_MAX_MULT = 6.0     # cap on the brightness multiplier (avoids runaway br
                            # -- raised from 4.0 for punchier, more contrasty caustic streaks;
                            # RayTracer.caustic_strength (below) gives a runtime dial on top of this.
 
+# --- GLASS CAUSTICS (photon pass for glass solids; see compute_glass_caustics) ---
+MAX_GLASS_CLUSTERS = 8          # glass blocks that overlap are merged into one cluster; this caps
+                                 # how many separate clusters get their own receiver map
+GLASS_CAUSTIC_RES = 128         # receiver-map resolution per cluster (cells per side)
+GLASS_PHOTON_STEPS = 12         # max glass interactions per photon (a cube needs 2; internal bounces add more)
+GLASS_MAX_CLUSTER_RADIUS = 30.0 # bigger "glass" (e.g. a giant slab) is skipped: photons would be
+                                 # spread too thin to resolve anything
+GLASS_Y_TOL = 0.05              # a surface counts as the receiver plane if within this of its height
+
 FLOOR_DEFAULT_VISIBILITY = 500.0  # world units -- half-extent of Scene.add_floor's default X/Z
                                    # square when no explicit `visibility`/`fog_max_depth` is given
                                    # (see there): far enough that the edge falls past the horizon/
@@ -675,10 +702,12 @@ _DEFAULT_UV = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
 
 class Face:
     __slots__ = ("verts", "normal", "color", "roughness", "transparency",
-                 "ior", "reflection_k", "uv", "texture_id")
+                 "ior", "reflection_k", "uv", "texture_id",
+                 "emissive", "emissive_color", "unlit", "two_sided")
 
     def __init__(self, verts, color, roughness=0.0, transparency=0.0,
-                 ior=1.5, reflection_k=0.0, uv=None, texture_id=-1):
+                 ior=1.5, reflection_k=0.0, uv=None, texture_id=-1,
+                 emissive=0.0, emissive_color=None, unlit=False, two_sided=False):
         self.verts = np.array(verts, dtype=float)
         n = np.cross(self.verts[1] - self.verts[0], self.verts[2] - self.verts[0])
         self.normal = normalize(n)
@@ -689,6 +718,19 @@ class Face:
         self.reflection_k = float(reflection_k)
         self.uv = np.array(uv if uv is not None else _DEFAULT_UV, dtype=np.float32)
         self.texture_id = int(texture_id)
+        # Self-illumination. `emissive` is a radiance multiplier (0 = none, 1 = the
+        # surface glows at its own colour's full brightness, >1 = overbright/bloomy).
+        # `emissive_color` (0-255 rgb) overrides WHAT colour it glows; None means "glow
+        # in the surface's own colour" (including its texture/video, per texel).
+        # `unlit` makes the face ignore scene lighting entirely (a screen/lamp shade
+        # that shows only its own emission); it still lights OTHER surfaces.
+        self.emissive = max(0.0, float(emissive))
+        self.emissive_color = (np.array(emissive_color[:3], dtype=float) / 255.0
+                               if emissive_color is not None else np.array([-1.0, -1.0, -1.0]))
+        self.unlit = bool(unlit)
+        # Flat planes (images/videos) emit from both sides; box faces only outward, which
+        # also stops light samples being wasted on a box's hidden back faces.
+        self.two_sided = bool(two_sided)
 
     def vertex_key(self, decimals=4):
         return frozenset(tuple(row) for row in np.round(self.verts, decimals))
@@ -730,12 +772,107 @@ def cull_internal_faces(faces):
 #    (N_TEX, TEX_SIZE, TEX_SIZE, 3).
 # =============================================================================
 
+class VideoSource:
+    """A looping video decoded with cv2, giving random access by frame index.
+
+    frame(idx) is cheap when idx is the frame right after the last one (plain
+    sequential decode -- the normal playback case), skips a few frames with
+    grab() when playback fell slightly behind, and seeks for anything else
+    (offline renders that jump around, e.g. parallel frame blocks). Indices
+    past the end wrap, so the video loops forever. Returns a uint8 RGBA
+    (size, size, 4) array, or None while nothing is decodable yet.
+    Audio is ignored."""
+
+    def __init__(self, path, size):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Video file not found: '{path}'")
+        self.path = path
+        self.size = int(size)
+        self.cap = cv2.VideoCapture(path)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Could not open video '{path}' (is it a format your OpenCV build can decode?)")
+        fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        self.fps = fps if 1.0 <= fps <= 240.0 else 30.0
+        self.native_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        self.native_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        n = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        self.n_frames = n if n > 0 else 0       # 0 = unknown; learned the first time playback hits the end
+        self._next = 0          # index the next sequential read() returns (None = unknown -> seek)
+        self.cur_idx = -1       # index of self.cur
+        self.cur = None
+        self.uploaded_idx = -1  # which frame the GPU texture currently holds (set by RayTracer)
+        self.first = self.frame(0)
+        if self.first is None:
+            raise RuntimeError(f"Video '{path}' opened but no frame could be decoded.")
+
+    @property
+    def duration(self):
+        return (self.n_frames / self.fps) if self.n_frames > 0 else 0.0
+
+    def index_at(self, t):
+        """Frame index shown at playback time t (seconds), with looping."""
+        idx = int(max(0.0, t) * self.fps + 1e-6)
+        return idx % self.n_frames if self.n_frames > 0 else idx
+
+    def _read(self):
+        ok, bgr = self.cap.read()
+        if not ok or bgr is None:
+            return None
+        small = cv2.resize(bgr, (self.size, self.size), interpolation=cv2.INTER_AREA)
+        return np.ascontiguousarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGBA))
+
+    def frame(self, idx):
+        """uint8 RGBA frame `idx` (wrapped to the video's length), or the last good frame."""
+        if self.n_frames > 0:
+            idx %= self.n_frames
+        if idx == self.cur_idx and self.cur is not None:
+            return self.cur
+        for _attempt in range(2):
+            nxt = self._next
+            if nxt is None or idx < nxt or idx - nxt > 8:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)      # rewind / big jump
+            else:
+                for _ in range(idx - nxt):                       # slightly behind: skip cheaply
+                    self.cap.grab()
+            arr = self._read()
+            if arr is not None:
+                self.cur, self.cur_idx, self._next = arr, idx, idx + 1
+                return arr
+            # Read failed: we ran off the end (or the container's frame count was missing or
+            # wrong). Frames 0..idx-1 exist, so that is the real length; wrap and retry.
+            # This is how videos with an unknown length learn it and then loop forever.
+            if idx <= 0:
+                break
+            self.n_frames = idx if self.n_frames <= 0 else min(self.n_frames, idx)
+            idx %= self.n_frames
+            self._next = None
+        return self.cur
+
+
 class TextureLibrary:
     TEX_SIZE = 512
 
     def __init__(self):
         self.paths = []
         self.arrays = []
+        self.videos = {}   # tex_id -> VideoSource (video textures are re-uploaded as playback advances)
+
+    def get_video_id(self, path):
+        """Texture slot for a looping video. The slot starts out holding frame 0 and
+        is refreshed by RayTracer.set_video_time(). Planes that use the same file
+        share one slot (one decoder, always in sync)."""
+        key = "video:" + path
+        if key in self.paths:
+            return self.paths.index(key)
+        src = VideoSource(path, self.TEX_SIZE)
+        self.paths.append(key)
+        self.arrays.append(src.first.astype(np.float32) / 255.0)
+        tex_id = len(self.arrays) - 1
+        self.videos[tex_id] = src
+        src.uploaded_idx = src.cur_idx   # the GPU texture is baked from frame 0
+        print(f"Video loaded: {path} -> id {tex_id} ({src.native_w}x{src.native_h} @ {src.fps:.2f} fps, "
+              f"{'%.1fs' % src.duration if src.n_frames else 'length unknown'}, loops)")
+        return tex_id
 
     def get_id(self, path):
         if path in self.paths:
@@ -779,45 +916,73 @@ class Scene:
         self.textures = TextureLibrary()
         self.water_blocks = []  # [(bmin np.float32[3], bmax np.float32[3], ior), ...] -- see add_water()
         self.ops = []       # construction log, for scene export (see module docstring)
+        self.glass_blocks = []  # [(center np.float64[3], bounding radius), ...] -- non-water
+                                # transparent solids, used by the glass-caustic photon pass
 
     def add_cube(self, pts, color, roughness=0.0, transparency=0.0,
-                 ior=1.5, reflection_k=0.0):
+                 ior=1.5, reflection_k=0.0, emissive=0.0, emissive_color=None, unlit=False):
         """pts: 8 vertices in the exact bit-index order described at _FACE_WINDING."""
         pts_arr = np.array(pts, dtype=float)
+        if transparency > 0.0 and not (1.30 < ior < 1.36):   # same water test as render_sample
+            ctr = pts_arr.mean(axis=0)
+            self.glass_blocks.append((ctr, float(np.linalg.norm(pts_arr - ctr, axis=1).max())))
         for fi in _FACE_WINDING:
             self.faces.append(Face([pts_arr[i] for i in fi], color,
-                                    roughness, transparency, ior, reflection_k))
+                                    roughness, transparency, ior, reflection_k,
+                                    emissive=emissive, emissive_color=emissive_color, unlit=unlit))
         self.boxes.append((pts_arr, tuple(int(c) for c in color[:3])))
 
     def add_box(self, center, size, color, roughness=0.0, transparency=0.0,
-                ior=1.5, reflection_k=0.0, rotation=(0.0, 0.0, 0.0)):
+                ior=1.5, reflection_k=0.0, rotation=(0.0, 0.0, 0.0),
+                emissive=0.0, emissive_color=None, unlit=False):
         """Box given by center+size, optionally rotated about its center via
         rotation=(yaw,pitch,roll) (radians). Rotation is fully compatible
-        with the BVH/raytracer (see the note at the top of this file)."""
-        self.ops.append({'method': 'add_box', 'kwargs': {
+        with the BVH/raytracer (see the note at the top of this file).
+
+        emissive: self-illumination strength (0 = off). The box glows in its own
+          `color` (or `emissive_color`, 0-255 rgb, if given) and, unless
+          RayTracer.emissive_lighting_enabled is off, also LIGHTS nearby surfaces
+          like an area light (soft shadows included). 1.0 = glows at the colour's
+          full brightness; try 2-6 for a lamp that reads as clearly lit.
+        unlit: True = ignore scene lighting entirely (shows only its glow)."""
+        op = {
             'center': list(map(float, center)), 'size': list(map(float, size)),
             'color': list(int(c) for c in color[:3]), 'roughness': float(roughness),
             'transparency': float(transparency), 'ior': float(ior),
             'reflection_k': float(reflection_k), 'rotation': list(map(float, rotation)),
-        }})
+        }
+        if emissive > 0.0:      # only logged when used, so older scene files stay byte-identical
+            op['emissive'] = float(emissive)
+            op['emissive_color'] = None if emissive_color is None else [int(c) for c in emissive_color[:3]]
+            op['unlit'] = bool(unlit)
+        elif unlit:
+            op['unlit'] = True
+        self.ops.append({'method': 'add_box', 'kwargs': op})
         self._add_box_geometry_only(center, size, color, roughness, transparency,
-                                     ior, reflection_k, rotation)
+                                     ior, reflection_k, rotation,
+                                     emissive=emissive, emissive_color=emissive_color, unlit=unlit)
 
     def add_image(self, center, size, image_path, rotation=(0.0, 0.0, 0.0),
                   roughness=0.0, transparency=0.0, ior=1.5, reflection_k=0.0,
-                  tint=(255, 255, 255)):
+                  tint=(255, 255, 255), emissive=0.0, emissive_color=None, unlit=False):
         """Adds a single 2D image plane as its own object. size=(w,h) in
         world units. rotation=(yaw,pitch,roll) radians about its center.
         The material parameters (roughness/transparency/ior/reflection_k)
         apply exactly like a box face -- e.g. you can make the image
         "frosted glass" or slightly reflective via transparency/reflection_k > 0."""
-        self.ops.append({'method': 'add_image', 'kwargs': {
+        op = {
             'center': list(map(float, center)), 'size': list(map(float, size)),
             'image_path': image_path, 'rotation': list(map(float, rotation)),
             'roughness': float(roughness), 'transparency': float(transparency),
             'ior': float(ior), 'reflection_k': float(reflection_k),
             'tint': list(int(c) for c in tint[:3]),
-        }})
+        }
+        if emissive > 0.0:
+            op['emissive'] = float(emissive)
+            op['emissive_color'] = None if emissive_color is None else [int(c) for c in emissive_color[:3]]
+        if unlit:
+            op['unlit'] = True
+        self.ops.append({'method': 'add_image', 'kwargs': op})
         w, h = size
         hw, hh = w / 2.0, h / 2.0
         local = np.array([(-hw, -hh, 0.0), (hw, -hh, 0.0),
@@ -828,12 +993,64 @@ class Scene:
         tex_id = self.textures.get_id(image_path)
         uv = ((0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0))
         f = Face(world, tint, roughness, transparency, ior, reflection_k,
-                 uv=uv, texture_id=tex_id)
+                 uv=uv, texture_id=tex_id,
+                 emissive=emissive, emissive_color=emissive_color, unlit=unlit, two_sided=True)
         self.faces.append(f)
 
         avg = self.textures.average_color(tex_id)
         avg_col = tuple(int(np.clip(c, 0, 1) * 255) for c in avg)
         self.quads.append((world, avg_col))
+        return f
+
+    def add_video(self, center, size, video_path, rotation=(0.0, 0.0, 0.0),
+                  emissive=1.0, unlit=True, emissive_color=None,
+                  roughness=0.0, transparency=0.0, ior=1.5, reflection_k=0.0,
+                  tint=(255, 255, 255)):
+        """A flat plane that plays a video, looping forever -- like add_image, but the
+        picture changes over time. size=(w, h) in world units; pass h=None (or a bare
+        number for w) to take the height from the video's own aspect ratio.
+
+        By default it behaves like a SCREEN: emissive=1.0 (it glows with the picture,
+        and that light spills onto nearby surfaces, tinted by whatever is on screen)
+        and unlit=True (the scene's lights don't wash the picture out). Use
+        emissive=0, unlit=False for a plain "painted" video texture that is lit like
+        any other surface.
+
+        Playback: live view toggles all videos with the SPACE bar; video renders
+        play them automatically from t=0 in step with the output timeline; stills use
+        --video-time. Every video plane shares the same clock. The video is decoded
+        at TextureLibrary.TEX_SIZE x TEX_SIZE (512 by default -- raise it, e.g.
+        --texture-size 1024, for sharper video at the cost of GPU memory)."""
+        tex_id = self.textures.get_video_id(video_path)
+        src = self.textures.videos[tex_id]
+        if isinstance(size, (int, float)):
+            size = (float(size), None)
+        w, h = size
+        if h is None:
+            aspect = (src.native_h / src.native_w) if src.native_w > 0 and src.native_h > 0 else 9.0 / 16.0
+            h = float(w) * aspect
+        size = (float(w), float(h))
+        op = {
+            'center': list(map(float, center)), 'size': list(size),
+            'video_path': video_path, 'rotation': list(map(float, rotation)),
+            'emissive': float(emissive), 'unlit': bool(unlit),
+            'emissive_color': None if emissive_color is None else [int(c) for c in emissive_color[:3]],
+            'roughness': float(roughness), 'transparency': float(transparency),
+            'ior': float(ior), 'reflection_k': float(reflection_k),
+            'tint': list(int(c) for c in tint[:3]),
+        }
+        self.ops.append({'method': 'add_video', 'kwargs': op})
+        hw, hh = size[0] / 2.0, size[1] / 2.0
+        local = np.array([(-hw, -hh, 0.0), (hw, -hh, 0.0),
+                           (hw, hh, 0.0), (-hw, hh, 0.0)], dtype=float)
+        world = local @ rotation_matrix(*rotation).T + np.array(center, dtype=float)
+        uv = ((0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0))
+        f = Face(world, tint, roughness, transparency, ior, reflection_k,
+                 uv=uv, texture_id=tex_id,
+                 emissive=emissive, emissive_color=emissive_color, unlit=unlit, two_sided=True)
+        self.faces.append(f)
+        avg = self.textures.average_color(tex_id)
+        self.quads.append((world, tuple(int(np.clip(c, 0, 1) * 255) for c in avg)))
         return f
 
     def add_water(self, center, size, color=(160, 230, 255), transparency=0.92, ior=1.333, rotation=(0.0, 0.0, 0.0)):
@@ -931,7 +1148,8 @@ class Scene:
                         color=color, transparency=transparency, ior=ior)
 
     def _add_box_geometry_only(self, center, size, color, roughness, transparency,
-                                ior, reflection_k, rotation):
+                                ior, reflection_k, rotation,
+                                emissive=0.0, emissive_color=None, unlit=False):
         """Same geometry as add_box() but WITHOUT logging an 'add_box' op
         (used internally by add_water/add_image so scene export doesn't
         double-log geometry under the wrong op type)."""
@@ -947,7 +1165,8 @@ class Scene:
             Rm = rotation_matrix(yaw, pitch, roll)
             local = local @ Rm.T
         pts = local + np.array([cx, cy, cz], dtype=float)
-        self.add_cube(pts, color, roughness, transparency, ior, reflection_k)
+        self.add_cube(pts, color, roughness, transparency, ior, reflection_k,
+                      emissive=emissive, emissive_color=emissive_color, unlit=unlit)
 
     def culled_faces(self):
         return cull_internal_faces(self.faces)
@@ -963,6 +1182,8 @@ class Scene:
                 if op['method'] == 'add_image':
                     path = op['kwargs'].get('image_path')
                     _embed_asset(assets, path)
+                elif op['method'] == 'add_video':
+                    _embed_asset(assets, op['kwargs'].get('video_path'))
         return {'ops': ops}
 
     @staticmethod
@@ -976,6 +1197,8 @@ class Scene:
             kwargs = dict(op.get('kwargs', {}))
             if op['method'] == 'add_image' and asset_dir is not None:
                 kwargs['image_path'] = _resolve_asset_path(kwargs.get('image_path'), asset_dir)
+            if op['method'] == 'add_video' and asset_dir is not None:
+                kwargs['video_path'] = _resolve_asset_path(kwargs.get('video_path'), asset_dir)
             method(**kwargs)
         return scene
 
@@ -986,6 +1209,7 @@ def triangulate(faces):
     normals, colors = [], []
     rough, transp, iors, refl = [], [], [], []
     uv0s, uv1s, uv2s, texids = [], [], [], []
+    emis, emis_col, unlit = [], [], []
     for f in faces:
         v = f.verts
         uv = f.uv
@@ -998,6 +1222,8 @@ def triangulate(faces):
             iors.append(f.ior); refl.append(f.reflection_k)
             uv0s.append(t0); uv1s.append(t1); uv2s.append(t2)
             texids.append(f.texture_id)
+            emis.append(f.emissive); emis_col.append(f.emissive_color)
+            unlit.append((1 if f.unlit else 0) | (2 if f.two_sided else 0))   # bit0 unlit, bit1 two-sided emitter
     return dict(
         v0=np.array(v0s, dtype=np.float32), v1=np.array(v1s, dtype=np.float32),
         v2=np.array(v2s, dtype=np.float32), normal=np.array(normals, dtype=np.float32),
@@ -1006,6 +1232,8 @@ def triangulate(faces):
         reflection_k=np.array(refl, dtype=np.float32),
         uv0=np.array(uv0s, dtype=np.float32), uv1=np.array(uv1s, dtype=np.float32),
         uv2=np.array(uv2s, dtype=np.float32), texture_id=np.array(texids, dtype=np.int32),
+        emissive=np.array(emis, dtype=np.float32), emissive_color=np.array(emis_col, dtype=np.float32),
+        unlit=np.array(unlit, dtype=np.int32),
     )
 
 
@@ -1863,10 +2091,12 @@ class SpotLight:
 F_V0 = F_V1 = F_V2 = F_NORMAL = None
 F_COLOR = F_ROUGH = F_TRANSP = F_IOR = F_REFL = None
 F_UV0 = F_UV1 = F_UV2 = F_TEXID = None
+F_EMIS = F_EMIS_COL = F_UNLIT = None          # per-triangle self-illumination (see Face)
+EM_TRI = EM_CDF = EM_PDF = EM_AREA = N_EM = EM_STRENGTH = None   # emissive-triangle light list
 TEX_FIELD = None
 N_MIN = N_MAX = N_LEFT = N_RIGHT = N_START = N_COUNT = None
 BG_FIELD = None
-LIGHT_POS = LIGHT_COLOR = LIGHT_BRIGHTNESS = LIGHT_VIS = None
+LIGHT_POS = LIGHT_COLOR = LIGHT_BRIGHTNESS = LIGHT_VIS = LIGHT_SOFT = None
 SPOT_POS = SPOT_DIR = SPOT_COLOR = SPOT_BRIGHTNESS = None
 SPOT_COS_OUTER = SPOT_COS_INNER = SPOT_VIS = None
 CLOUD_ENABLED = CLOUD_BASE = CLOUD_TOP = CLOUD_DENSITY = CLOUD_COVERAGE = None
@@ -1876,6 +2106,8 @@ CLOUD_TIME = None                           # "billow" offset -- see _cloud_dens
                                              # so cross-sections morph/churn instead of just sliding
                                              # sideways the way CLOUD_WIND (a rigid xz translation) does.
 PROBE_DEPTH = None
+GC_CENTER = GC_RADIUS = GC_HALF = GC_RECV_Y = GC_VALID = N_GC = None
+GLASS_ACC = GLASS_TMP = GLASS_MAP = GLASS_STRENGTH = None
 WB_MIN = WB_MAX = WB_IOR = N_WATER_FIELD = None
 WATER_TIME = None                           # time (seconds) used to make the water ripple
                                              # "run" when rendering video -- 0.0 (default) =
@@ -1894,6 +2126,8 @@ def upload_scene_geometry(bvh: BVH, background: Background, texture_lib: Texture
     _alloc_buffers)."""
     global F_V0, F_V1, F_V2, F_NORMAL, F_COLOR, F_ROUGH, F_TRANSP, F_IOR, F_REFL
     global F_UV0, F_UV1, F_UV2, F_TEXID, TEX_FIELD
+    global F_EMIS, F_EMIS_COL, F_UNLIT
+    global EM_TRI, EM_CDF, EM_PDF, EM_AREA, N_EM, EM_STRENGTH
     global N_MIN, N_MAX, N_LEFT, N_RIGHT, N_START, N_COUNT
     global BG_FIELD, ROOT_NODE, N_TRI
 
@@ -1914,6 +2148,34 @@ def upload_scene_geometry(bvh: BVH, background: Background, texture_lib: Texture
     F_UV1 = ti.Vector.field(2, ti.f32, shape=n); F_UV1.from_numpy(tri['uv1'][order])
     F_UV2 = ti.Vector.field(2, ti.f32, shape=n); F_UV2.from_numpy(tri['uv2'][order])
     F_TEXID = ti.field(ti.i32, shape=n); F_TEXID.from_numpy(tri['texture_id'][order])
+    F_EMIS = ti.field(ti.f32, shape=n); F_EMIS.from_numpy(tri['emissive'][order])
+    F_EMIS_COL = ti.Vector.field(3, ti.f32, shape=n); F_EMIS_COL.from_numpy(tri['emissive_color'][order])
+    F_UNLIT = ti.field(ti.i32, shape=n); F_UNLIT.from_numpy(tri['unlit'][order])
+
+    # Emissive triangles double as AREA LIGHTS. Sorted into BVH order like everything
+    # else, then given a CDF proportional to (area x strength x brightness) so brighter/
+    # bigger emitters are picked more often by the one light sample taken per shaded point.
+    em_idx = np.nonzero(tri['emissive'][order] > 0.0)[0].astype(np.int32)
+    n_em = int(len(em_idx))
+    k = max(1, n_em)
+    EM_TRI = ti.field(ti.i32, shape=k); EM_CDF = ti.field(ti.f32, shape=k)
+    EM_PDF = ti.field(ti.f32, shape=k); EM_AREA = ti.field(ti.f32, shape=k)
+    N_EM = ti.field(ti.i32, shape=()); EM_STRENGTH = ti.field(ti.f32, shape=())
+    N_EM[None] = n_em
+    EM_STRENGTH[None] = 1.0
+    if n_em:
+        v0 = tri['v0'][order][em_idx]; v1 = tri['v1'][order][em_idx]; v2 = tri['v2'][order][em_idx]
+        area = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1).astype(np.float32)
+        ecol = tri['emissive_color'][order][em_idx]
+        base = np.where((ecol[:, :1] >= 0.0), ecol, tri['color'][order][em_idx])
+        lum = np.maximum(0.05, base @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32))
+        w = np.maximum(1e-12, area * tri['emissive'][order][em_idx] * lum)
+        pdf = (w / w.sum()).astype(np.float32)
+        cdf = np.cumsum(pdf).astype(np.float32); cdf[-1] = 1.0
+        EM_TRI.from_numpy(np.pad(em_idx, (0, k - n_em)))
+        EM_CDF.from_numpy(np.pad(cdf, (0, k - n_em), constant_values=1.0))
+        EM_PDF.from_numpy(np.pad(pdf, (0, k - n_em), constant_values=1.0))
+        EM_AREA.from_numpy(np.pad(area, (0, k - n_em), constant_values=1.0))
 
     N = bvh.n_nodes
     N_MIN = ti.Vector.field(3, ti.f32, shape=N); N_MIN.from_numpy(bvh.node_min)
@@ -1938,7 +2200,7 @@ def upload_scene_geometry(bvh: BVH, background: Background, texture_lib: Texture
 
 
 def alloc_light_fields():
-    global LIGHT_POS, LIGHT_COLOR, LIGHT_BRIGHTNESS, LIGHT_VIS
+    global LIGHT_POS, LIGHT_COLOR, LIGHT_BRIGHTNESS, LIGHT_VIS, LIGHT_SOFT
     global SPOT_POS, SPOT_DIR, SPOT_COLOR, SPOT_BRIGHTNESS
     global SPOT_COS_OUTER, SPOT_COS_INNER, SPOT_VIS, PROBE_DEPTH
     LIGHT_POS = ti.Vector.field(3, ti.f32, shape=MAX_LIGHTS)
@@ -1954,6 +2216,29 @@ def alloc_light_fields():
     SPOT_COS_INNER = ti.field(ti.f32, shape=MAX_SPOTLIGHTS)
     SPOT_VIS = ti.field(ti.i32, shape=MAX_SPOTLIGHTS)
     PROBE_DEPTH = ti.field(ti.f32, shape=())
+    LIGHT_SOFT = ti.field(ti.f32, shape=())   # light angular radius (tan) -> penumbra softness
+    LIGHT_SOFT[None] = 0.0
+
+
+def alloc_glass_fields():
+    """Fields for the glass-caustic photon pass (called once, like the other
+    alloc_* functions). N_GC = 0 means "no glass clusters", which makes the
+    shading-side lookup a single field read."""
+    global GC_CENTER, GC_RADIUS, GC_HALF, GC_RECV_Y, GC_VALID, N_GC
+    global GLASS_ACC, GLASS_TMP, GLASS_MAP, GLASS_STRENGTH
+    GC_CENTER = ti.Vector.field(3, ti.f32, shape=MAX_GLASS_CLUSTERS)
+    GC_RADIUS = ti.field(ti.f32, shape=MAX_GLASS_CLUSTERS)
+    GC_HALF = ti.field(ti.f32, shape=MAX_GLASS_CLUSTERS)      # half-extent of the receiver map
+    GC_RECV_Y = ti.field(ti.f32, shape=MAX_GLASS_CLUSTERS)    # height of the surface under the glass
+    GC_VALID = ti.field(ti.i32, shape=MAX_GLASS_CLUSTERS)
+    N_GC = ti.field(ti.i32, shape=())
+    shape3 = (MAX_GLASS_CLUSTERS, GLASS_CAUSTIC_RES, GLASS_CAUSTIC_RES)
+    GLASS_ACC = ti.Vector.field(3, ti.f32, shape=shape3)      # raw splatted photon energy (signed)
+    GLASS_TMP = ti.Vector.field(3, ti.f32, shape=shape3)
+    GLASS_MAP = ti.Vector.field(3, ti.f32, shape=shape3)      # blurred result, read at render time
+    GLASS_STRENGTH = ti.field(ti.f32, shape=())
+    N_GC[None] = 0
+    GLASS_STRENGTH[None] = 0.0
 
 
 def alloc_water_fields():
@@ -2528,6 +2813,12 @@ def _cloud_shadow_transmittance(ro: vec3, rd: vec3, tmax: ti.f32) -> ti.f32:
 
 
 @ti.func
+def _rand_in_ball() -> vec3:
+    d = vec3(ti.randn(), ti.randn(), ti.randn()).normalized()
+    return d * ti.pow(ti.random(ti.f32), 1.0 / 3.0)
+
+
+@ti.func
 def _perturb_in_cone(n: vec3, roughness: ti.f32) -> vec3:
     res = n
     if roughness > 1e-4:
@@ -2647,9 +2938,7 @@ def _shadow_throughput(p_from: vec3, light_pos: vec3) -> vec3:
     throughput = vec3(1.0)
     ro = p_from
     travelled = 0.0
-    seg_carry = 0.0   # distance skipped through transparent-PNG pixels since the last
-                      # real occluder -- added back to `t` so Beer-Lambert absorption
-                      # through glass isn't shortened by an image plane in front of it
+    inside_start = 0.0   # path distance at which the ray last entered a glass solid
 
     if CLOUD_ENABLED[None] != 0:
         # This is the actual "clouds cast shadows on objects" mechanism --
@@ -2693,13 +2982,9 @@ def _shadow_throughput(p_from: vec3, light_pos: vec3) -> vec3:
             step = t + 1e-3
             ro = ro + ldir * step
             travelled += step
-            seg_carry += step
             if travelled >= light_dist:
                 break
             continue  # jump to the next iteration to look for another occluder behind it
-
-        t = t + seg_carry
-        seg_carry = 0.0
 
         # --- HANDLE A NORMAL OCCLUDER (glass or an opaque object) ---
         if transp <= 0.0:
@@ -2708,26 +2993,30 @@ def _shadow_throughput(p_from: vec3, light_pos: vec3) -> vec3:
 
         col = F_COLOR[tid]
 
-        # NOTE: an earlier version here had a hack that "bent" the shadow
-        # ray along the ripple normal (ldir += 0.35*(wn-gn)) to fake
-        # caustics. That hack never produced real light/dark patterns: it
-        # only nudged the ray direction slightly (by an arbitrary amount,
-        # not following Snell's law), while STILL using the original total
-        # path length (light_dist) to decide when to stop -- meaning it
-        # never even checked whether the bent ray still pointed at the
-        # light, so in practice it had almost no effect on the final image
-        # (as the user observed: no visible caustics). More importantly,
-        # even with a properly Snell-corrected bend, bending a single
-        # shadow ray CANNOT produce a converging bright region (caustics
-        # are physically the result of many nearby rays being refracted
-        # together into one point) -- that requires comparing the DENSITY
-        # of rays between nearby points, not a single ray -- see
-        # compute_caustics_kernel() + _sample_caustic() below, which is
-        # where caustics are ACTUALLY computed (a photon-density map,
-        # precomputed once per light position, not per shadow ray). So
-        # this function only keeps Beer-Lambert (the water's color/opacity)
-        # for the shadow ray, no more direction bending.
-        throughput *= _beer_lambert_tint(col, transp, t)
+        # Absolute distance along the shadow ray to this hit. `travelled`
+        # already includes every cutout step, so no seg_carry is needed.
+        s_hit = travelled + t
+
+        # Straight shadow rays through a glass solid. Two physical effects,
+        # both of which the old code got wrong/omitted (hence "flat"):
+        #  * Beer-Lambert absorption over the distance INSIDE the glass only.
+        #    The old code applied it for every hit using `t`, which is the
+        #    distance from the previous point (air!) -- so the shadow tint
+        #    depended on how far the receiver was from the glass.
+        #  * Fresnel loss at each interface: ~8% at normal incidence but rising
+        #    sharply at grazing angles, so shadows get darker toward the
+        #    silhouette/edges of the glass -- the main depth cue in a real one.
+        geo_n = F_NORMAL[tid]
+        cosg = ldir.dot(geo_n)
+        cos_i = ti.min(1.0, ti.abs(cosg))
+        gior = F_IOR[tid]
+        if cosg < 0.0:
+            inside_start = s_hit          # entering the solid
+        else:
+            throughput *= _beer_lambert_tint(col, transp, ti.max(0.0, s_hit - inside_start))
+        # air->glass and glass->air interfaces of a slab have equal
+        # transmittance for a given external angle.
+        throughput *= (1.0 - _fresnel_schlick(cos_i, gior))
 
         step = t + 1e-3
         ro = ro + ldir * step
@@ -2943,6 +3232,352 @@ def compute_caustics_kernel(n_water: ti.i32, n_lights: ti.i32, n_spots: ti.i32):
 
 
 # =============================================================================
+# 10a) Video textures + emissive area lights
+# =============================================================================
+
+@ti.kernel
+def upload_texture_u8(tex_id: ti.i32, frame: ti.types.ndarray(dtype=ti.u8, ndim=3)):
+    """Overwrites one TEX_FIELD slot with a uint8 RGBA frame (a video frame)."""
+    for y, x in ti.ndrange(frame.shape[0], frame.shape[1]):
+        TEX_FIELD[tex_id, y, x] = vec4(ti.cast(frame[y, x, 0], ti.f32), ti.cast(frame[y, x, 1], ti.f32),
+                                       ti.cast(frame[y, x, 2], ti.f32), ti.cast(frame[y, x, 3], ti.f32)) / 255.0
+
+
+@ti.func
+def _emitted_radiance(tid: ti.i32, tex_rgb: vec3) -> vec3:
+    """Radiance a face emits at a point whose (already texture-multiplied) albedo
+    is `tex_rgb`: its explicit emissive_color if it has one, else its own colour."""
+    ec = F_EMIS_COL[tid]
+    base = tex_rgb
+    if ec[0] >= 0.0:
+        base = ec
+    return base * F_EMIS[tid]
+
+
+@ti.func
+def _sample_emissive_light(p: vec3, n: vec3) -> vec3:
+    """One-sample area-light estimate of the light that emissive faces (screens,
+    lamps, glowing boxes) deliver to point p with normal n, BEFORE multiplying by
+    the receiver's albedo. A face is picked by power (CDF), a point on it uniformly,
+    then a shadow ray (glass tints it, opaque blocks it). Lambertian: albedo/pi * E."""
+    res = vec3(0.0)
+    nem = N_EM[None]
+    if nem > 0:
+        u = ti.random(ti.f32)
+        lo = 0
+        hi = nem - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if EM_CDF[mid] < u:
+                lo = mid + 1
+            else:
+                hi = mid
+        tid = EM_TRI[lo]
+        r1 = ti.sqrt(ti.random(ti.f32))
+        r2 = ti.random(ti.f32)
+        b0 = 1.0 - r1
+        b1 = r1 * (1.0 - r2)
+        b2 = r1 * r2
+        q = F_V0[tid] * b0 + F_V1[tid] * b1 + F_V2[tid] * b2
+        to = q - p
+        d2 = ti.max(to.dot(to), 1e-2)
+        wi = to / ti.sqrt(d2)
+        cos_s = n.dot(wi)
+        cos_l = -F_NORMAL[tid].dot(wi)             # light leaves through the face's outward side...
+        if (F_UNLIT[tid] & 2) != 0:
+            cos_l = ti.abs(cos_l)                  # ...except flat planes (images/videos), which emit both ways
+        if cos_s > 1e-4 and cos_l > 1e-4:
+            albedo = F_COLOR[tid]
+            alpha = 1.0
+            texid = F_TEXID[tid]
+            if texid >= 0:
+                uvp = F_UV0[tid] * b0 + F_UV1[tid] * b1 + F_UV2[tid] * b2
+                texel = _sample_texture(texid, uvp[0], uvp[1])
+                albedo = albedo * vec3(texel[0], texel[1], texel[2])
+                alpha = texel[3]
+            if alpha >= 0.1:
+                le = _emitted_radiance(tid, albedo)
+                tp = _shadow_throughput(p + n * 1e-3, q - wi * 0.01)
+                res = le * tp * (cos_s * cos_l * EM_AREA[lo] / (d2 * EM_PDF[lo] * math.pi))
+    return res
+
+
+# =============================================================================
+# 10b) Glass caustics (photon pass).
+#
+# The shadow rays in _shadow_throughput are straight, so on their own they
+# can only make glass cast a uniformly tinted, slightly dimmed shadow. Real
+# glass REDISTRIBUTES light: it shifts it sideways and bunches it up at
+# bright streaks/edges, leaving darker bands next to them. This pass
+# computes that redistribution once (not per frame):
+#
+#   * For every (glass cluster, light) pair, photons are fired at the cluster's
+#     bounding disc as seen from the light.
+#   * Each photon is traced TWICE through the real BVH: once refracting
+#     (Snell + Fresnel + Beer-Lambert) -> where the light REALLY lands, and
+#     once straight -> where the straight shadow ray in _shadow_throughput
+#     already assumes it lands (with the same Fresnel/absorption).
+#   * Energy is splatted into a 2D receiver map: +P at the real landing
+#     point, -P at the straight one. So the map is the *difference* between
+#     real and straight lighting: it adds to what the shadow rays already
+#     deliver, never double-counts, and is energy-neutral (just moves light).
+#   * The map is blurred a little, then render_sample adds `albedo * map`.
+#
+# Cost: the photon pass is a one-off per light/scene change. Per frame the
+# only cost is one bilinear lookup per diffuse hit on an up-facing surface
+# (and a single field read when the scene has no glass at all).
+# Limits: receivers are the up-facing surface directly under each cluster
+# (typically the floor); only transmitted light is traced (total internal
+# reflection photons bounce up to GLASS_PHOTON_STEPS), and occluders between light and glass are
+# tested for opaque blockers only.
+# =============================================================================
+
+@ti.func
+def _gc_trace(ro_in: vec3, rd_in: vec3, straight: ti.i32):
+    """Follows one photon until it lands on an opaque surface. straight=0
+    refracts at every glass face; straight=1 goes in a straight line and
+    applies the same Fresnel/absorption as _shadow_throughput. Returns
+    (landed, landing_point, landing_normal, throughput, touched_glass)."""
+    ro = ro_in
+    rd = rd_in
+    w = vec3(1.0)
+    touched = 0
+    landed = 0
+    lp = vec3(0.0)
+    ln = vec3(0.0, 1.0, 0.0)
+    inside_start = 0.0
+    travelled = 0.0
+    alive = 1
+    for _ in range(GLASS_PHOTON_STEPS):
+        if alive != 0:
+            tid, t, bu, bv = _bvh_closest_hit(ro, rd, 1e18)
+            if tid < 0:
+                alive = 0
+            else:
+                p = ro + rd * t
+                transp = F_TRANSP[tid]
+                texid = F_TEXID[tid]
+                cutout = 0
+                if texid >= 0:
+                    uv0 = F_UV0[tid]; uv1 = F_UV1[tid]; uv2 = F_UV2[tid]
+                    uvp = uv0 * (1.0 - bu - bv) + uv1 * bu + uv2 * bv
+                    tex_rgba = _sample_texture(texid, uvp[0], uvp[1])
+                    if tex_rgba[3] < 0.1:
+                        cutout = 1
+                if cutout != 0:
+                    ro = p + rd * 1e-3
+                    travelled += t + 1e-3
+                elif transp <= 0.0:
+                    lp = p
+                    ln = F_NORMAL[tid]
+                    landed = 1
+                    alive = 0
+                else:
+                    touched = 1
+                    col = F_COLOR[tid]
+                    ior = F_IOR[tid]
+                    gn = F_NORMAL[tid]
+                    entering = rd.dot(gn) < 0.0
+                    n = gn if entering else -gn
+                    if straight != 0:
+                        s_hit = travelled + t
+                        cos_i = ti.min(1.0, ti.abs(rd.dot(gn)))
+                        if entering:
+                            inside_start = s_hit
+                        else:
+                            w *= _beer_lambert_tint(col, transp, ti.max(0.0, s_hit - inside_start))
+                        w *= (1.0 - _fresnel_schlick(cos_i, ior))
+                        ro = p + rd * 1e-3
+                        travelled += t + 1e-3
+                    else:
+                        if not entering:
+                            w *= _beer_lambert_tint(col, transp, t)
+                        cosi = ti.max(1e-6, rd.dot(-n))
+                        eta = (1.0 / ior) if entering else ior
+                        sin2_t = eta * eta * (1.0 - cosi * cosi)
+                        if sin2_t > 1.0:
+                            # Total internal reflection: the photon stays inside and bounces on
+                            # (no loss -- F = 1). It exits through another face, or runs out of
+                            # steps. Dropping it instead (as a first version did) removed far
+                            # too much light: a cube lit from the side TIRs on its bottom face.
+                            rd = (rd - 2.0 * rd.dot(n) * n).normalized()
+                            ro = p + n * 1e-4
+                        else:
+                            cos_s = cosi
+                            if not entering:
+                                cos_s = ti.sqrt(ti.max(0.0, 1.0 - sin2_t))
+                            w *= (1.0 - _fresnel_schlick(cos_s, ior))
+                            cost = ti.sqrt(ti.max(0.0, 1.0 - sin2_t))
+                            rd = (eta * rd + (eta * cosi - cost) * n).normalized()
+                            ro = p - n * 1e-4
+    return landed, lp, ln, w, touched
+
+
+@ti.func
+def _gc_land_ok(ci: ti.i32, lp: vec3, ln: vec3) -> ti.i32:
+    ok = 0
+    if GC_VALID[ci] != 0 and ln[1] > 0.5 and ti.abs(lp[1] - GC_RECV_Y[ci]) < GLASS_Y_TOL:
+        h = GC_HALF[ci]
+        c = GC_CENTER[ci]
+        if ti.abs(lp[0] - c[0]) < h and ti.abs(lp[2] - c[2]) < h:
+            ok = 1
+    return ok
+
+
+@ti.func
+def _gc_deposit(ci: ti.i32, lp: vec3, val: vec3):
+    h = GC_HALF[ci]
+    c = GC_CENTER[ci]
+    res = float(GLASS_CAUSTIC_RES)
+    fu = (lp[0] - (c[0] - h)) / (2.0 * h) * res - 0.5
+    fv = (lp[2] - (c[2] - h)) / (2.0 * h) * res - 0.5
+    ix = int(ti.floor(fu))
+    iz = int(ti.floor(fv))
+    tx = fu - float(ix)
+    tz = fv - float(iz)
+    cell = 2.0 * h / res
+    v = val / (cell * cell)       # energy -> irradiance (power per receiver area)
+    for dz in ti.static(range(2)):
+        for dx in ti.static(range(2)):
+            xx = ix + dx
+            zz = iz + dz
+            wx = (1.0 - tx) + (2.0 * tx - 1.0) * dx
+            wz = (1.0 - tz) + (2.0 * tz - 1.0) * dz
+            if 0 <= xx < GLASS_CAUSTIC_RES and 0 <= zz < GLASS_CAUSTIC_RES:
+                GLASS_ACC[ci, zz, xx] += v * (wx * wz)
+
+
+@ti.kernel
+def glass_probe_receivers(n_clusters: ti.i32):
+    """Finds the opaque surface straight below each cluster's centre (looking
+    through any glass on the way) -- that height is the receiver plane."""
+    for ci in range(n_clusters):
+        ro = GC_CENTER[ci]
+        down = vec3(0.0, -1.0, 0.0)
+        state = 0
+        y = 0.0
+        for _ in range(GLASS_PHOTON_STEPS):
+            if state == 0:
+                tid, t, _bu, _bv = _bvh_closest_hit(ro, down, 1e18)
+                if tid < 0:
+                    state = -1
+                else:
+                    p = ro + down * t
+                    if F_TRANSP[tid] <= 0.0:
+                        state = 1
+                        y = p[1]
+                    else:
+                        ro = p + down * 1e-3
+        GC_VALID[ci] = 1 if state == 1 else 0
+        GC_RECV_Y[ci] = y
+
+
+@ti.kernel
+def glass_caustics_kernel(n_clusters: ti.i32, n_lights: ti.i32, n_spots: ti.i32, n_photons: ti.i32):
+    for ci, ei, k in ti.ndrange(n_clusters, n_lights + n_spots, n_photons):
+        lpos = vec3(0.0)
+        lpow = vec3(0.0)
+        sdir = vec3(0.0, 0.0, 1.0)
+        si = 0
+        if ei < n_lights:
+            lpos = LIGHT_POS[ei]
+            lpow = LIGHT_COLOR[ei] * LIGHT_BRIGHTNESS[ei]
+        else:
+            si = ei - n_lights
+            lpos = SPOT_POS[si]
+            lpow = SPOT_COLOR[si] * SPOT_BRIGHTNESS[si]
+            sdir = SPOT_DIR[si]
+        if lpow.max() > 1e-6 and GC_VALID[ci] != 0:
+            c = GC_CENTER[ci]
+            r = GC_RADIUS[ci]
+            to_c = c - lpos
+            dist = to_c.norm()
+            axis = to_c / ti.max(dist, 1e-6)
+            helper = vec3(0.0, 1.0, 0.0)
+            if ti.abs(axis[1]) > 0.95:
+                helper = vec3(1.0, 0.0, 0.0)
+            t1 = axis.cross(helper).normalized()
+            t2 = axis.cross(t1)
+            rr = r * ti.sqrt(ti.random(ti.f32))
+            phi = 2.0 * math.pi * ti.random(ti.f32)
+            q = c + t1 * (rr * ti.cos(phi)) + t2 * (rr * ti.sin(phi))
+            d = (q - lpos).normalized()
+
+            atten = 1.0
+            ok = 1
+            if dist < 2.5 * r:
+                ok = 0                      # light inside/too close to the cluster: skip
+            if ei >= n_lights:
+                cos_theta = d.dot(sdir)
+                cos_outer = SPOT_COS_OUTER[si]
+                cos_inner = SPOT_COS_INNER[si]
+                if cos_theta > cos_outer:
+                    cone_t = ti.max(0.0, ti.min(1.0, (cos_theta - cos_outer) / ti.max(cos_inner - cos_outer, 1e-4)))
+                    atten = cone_t * cone_t * (3.0 - 2.0 * cone_t)
+                else:
+                    ok = 0
+
+            s0 = q - d * (2.0 * r)          # start just outside the cluster's bounding sphere
+            if ok != 0:
+                # An OPAQUE occluder between the light and the glass (e.g. a wall) blocks the photon.
+                oh, ot, _ou, _ov = _bvh_closest_hit(lpos, d, dist - 2.0 * r - 1e-3)
+                if oh >= 0 and F_TRANSP[oh] <= 0.0:
+                    ok = 0
+
+            if ok != 0:
+                power = lpow * (math.pi * r * r / float(n_photons)) * atten
+                landed_r, lp_r, ln_r, w_r, touched_r = _gc_trace(s0, d, 0)
+                landed_s, lp_s, ln_s, w_s, touched_s = _gc_trace(s0, d, 1)
+                if touched_s != 0:
+                    if landed_s != 0 and _gc_land_ok(ci, lp_s, ln_s) != 0:
+                        _gc_deposit(ci, lp_s, -power * w_s)
+                    if landed_r != 0 and _gc_land_ok(ci, lp_r, ln_r) != 0:
+                        _gc_deposit(ci, lp_r, power * w_r)
+
+
+@ti.kernel
+def glass_blur_h(n: ti.i32, src: ti.template(), dst: ti.template()):
+    for ci, z, x in ti.ndrange(n, GLASS_CAUSTIC_RES, GLASS_CAUSTIC_RES):
+        xm = ti.max(x - 1, 0)
+        xp = ti.min(x + 1, GLASS_CAUSTIC_RES - 1)
+        dst[ci, z, x] = (src[ci, z, xm] + 2.0 * src[ci, z, x] + src[ci, z, xp]) * 0.25
+
+
+@ti.kernel
+def glass_blur_v(n: ti.i32, src: ti.template(), dst: ti.template()):
+    for ci, z, x in ti.ndrange(n, GLASS_CAUSTIC_RES, GLASS_CAUSTIC_RES):
+        zm = ti.max(z - 1, 0)
+        zp = ti.min(z + 1, GLASS_CAUSTIC_RES - 1)
+        dst[ci, z, x] = (src[ci, zm, x] + 2.0 * src[ci, z, x] + src[ci, zp, x]) * 0.25
+
+
+@ti.func
+def _sample_glass_caustic(p: vec3, n: vec3) -> vec3:
+    """Signed extra irradiance (rgb) at p from glass caustics -- zero unless
+    p is an up-facing surface at a cluster's receiver height, inside its map."""
+    res = vec3(0.0)
+    if n[1] > 0.5:
+        for ci in range(N_GC[None]):
+            if GC_VALID[ci] != 0:
+                c = GC_CENTER[ci]
+                h = GC_HALF[ci]
+                if (ti.abs(p[1] - GC_RECV_Y[ci]) < GLASS_Y_TOL
+                        and ti.abs(p[0] - c[0]) < h and ti.abs(p[2] - c[2]) < h):
+                    rs = float(GLASS_CAUSTIC_RES)
+                    fx = ti.max(0.0, ti.min(rs - 1.0, (p[0] - (c[0] - h)) / (2.0 * h) * rs - 0.5))
+                    fz = ti.max(0.0, ti.min(rs - 1.0, (p[2] - (c[2] - h)) / (2.0 * h) * rs - 0.5))
+                    x0 = int(fx); z0 = int(fz)
+                    x1 = ti.min(x0 + 1, GLASS_CAUSTIC_RES - 1)
+                    z1 = ti.min(z0 + 1, GLASS_CAUSTIC_RES - 1)
+                    tx = fx - float(x0); tz = fz - float(z0)
+                    res += (GLASS_MAP[ci, z0, x0] * ((1.0 - tx) * (1.0 - tz))
+                            + GLASS_MAP[ci, z0, x1] * (tx * (1.0 - tz))
+                            + GLASS_MAP[ci, z1, x0] * ((1.0 - tx) * tz)
+                            + GLASS_MAP[ci, z1, x1] * (tx * tz))
+    return res
+
+
+# =============================================================================
 # 11) Main render kernel -- loops over N lights, samples textures by UV,
 #     accumulates DEPTH (used for DoF) alongside color.
 # =============================================================================
@@ -3063,6 +3698,14 @@ def render_sample(
             ior = F_IOR[tid]
             refl_k = F_REFL[tid]
 
+            # Self-illumination: the face's own glow, added straight to the pixel
+            # (through any reflection/refraction throughput that got us here).
+            # `col` already includes the texture/video texel, so a video plane glows
+            # with whatever frame is currently showing.
+            if F_EMIS[tid] > 0.0:
+                final_color += throughput * _emitted_radiance(tid, col)
+            is_unlit = (F_UNLIT[tid] & 1) != 0
+
             cos_i_signed = -ray_dir.dot(geo_n)
             entering = cos_i_signed > 0.0
             n = geo_n if entering else -geo_n
@@ -3074,6 +3717,16 @@ def render_sample(
                     terminated = True
                     continue
 
+                # Beer-Lambert absorption belongs to the distance travelled INSIDE
+                # the medium. If this hit is from the inside (not `entering`), the
+                # segment we just crossed was inside the glass -- tint it, whether
+                # the ray then reflects (internal bounce) or refracts out. (The old
+                # code tinted on every refraction instead, so a ray ENTERING glass
+                # was tinted by its air distance to the surface, and internal
+                # reflections were never absorbed at all.)
+                if not entering:
+                    throughput *= _beer_lambert_tint(col, transp, t)
+
                 ns = n
                 if ior > 1.30 and ior < 1.36:
                     ns = _get_water_normal(p, n)
@@ -3082,24 +3735,43 @@ def render_sample(
                 cosi = ti.max(1e-6, ray_dir.dot(-ns))
                 eta = (1.0 / ior) if entering else ior
                 sin2_t = eta * eta * (1.0 - cosi * cosi)
+                tir = sin2_t > 1.0
 
+                # Fresnel reflectance. Schlick must be fed the cosine on the
+                # DENSER side's... i.e. for glass->air use the transmitted angle's
+                # cosine (not the incident one), otherwise exits are far too
+                # transmissive. TIR is a perfect (F = 1) reflection.
                 fresnel = 1.0
-                if sin2_t <= 1.0:
-                    fresnel = _fresnel_schlick(cosi, ior)
-                p_reflect = ti.max(0.05, ti.min(0.95, fresnel))
+                if not tir:
+                    cos_s = cosi
+                    if not entering:
+                        cos_s = ti.sqrt(ti.max(0.0, 1.0 - sin2_t))
+                    fresnel = _fresnel_schlick(cos_s, ior)
+
+                # Russian-roulette choice between reflect / refract. The clamp only
+                # keeps variance sane; the weights below are what keep it unbiased.
+                p_reflect = 1.0
+                if not tir:
+                    p_reflect = ti.max(0.05, ti.min(0.95, fresnel))
 
                 if ti.random(ti.f32) < p_reflect:
                     rdir = (ray_dir - 2.0 * ray_dir.dot(ns) * ns).normalized()
                     ray_o = p + n * 1e-4
                     ray_dir = rdir
-                    throughput /= p_reflect
+                    # estimator weight = F / p. (The old `/= p_reflect` forgot the F:
+                    # a reflection that really carries ~4% of the light was counted
+                    # at ~100% (x20 when p was clamped to 0.05) and TIR's 5% leftover
+                    # branch got a 1/0.05 = x20 weight on a bogus refraction. That
+                    # energy gain is the self-glow + the sparkle noise.)
+                    throughput *= fresnel / p_reflect
                 else:
                     cost = ti.sqrt(ti.max(0.0, 1.0 - sin2_t))
                     rdir = (eta * ray_dir + (eta * cosi - cost) * ns).normalized()
-                    throughput *= _beer_lambert_tint(col, transp, t)
                     ray_o = p - n * 1e-4
                     ray_dir = rdir
-                    throughput /= (1.0 - p_reflect)
+                    # weight = (1 - F) / (1 - p); radiance scales by eta^2 when
+                    # crossing media but cancels on the way back out, so omitted.
+                    throughput *= (1.0 - fresnel) / ti.max(1e-4, 1.0 - p_reflect)
 
                 real_bounce += 1
                 if throughput.max() < 1e-3:
@@ -3122,11 +3794,25 @@ def render_sample(
                 # behind the camera in that direction, sky or not.
                 sky_col = _sample_background(n)
                 ambient_term = col * (ambient + sky_light_strength * bg_brightness * sky_col)
+                if is_unlit:
+                    ambient_term = vec3(0.0)
                 direct = vec3(0.0)
-                for li in range(n_lights):
+                n_lights_eff = n_lights
+                n_spots_eff = n_spots
+                if is_unlit:
+                    n_lights_eff = 0      # unlit faces (screens) ignore scene lighting
+                    n_spots_eff = 0
+                for li in range(n_lights_eff):
                     lpos = LIGHT_POS[li]
                     lcol = LIGHT_COLOR[li]
                     lbri = LIGHT_BRIGHTNESS[li]
+                    # Area-light jitter: treat the light as a small sphere of
+                    # angular radius LIGHT_SOFT (radius scales with distance, so
+                    # a far "sun" and a near lamp both get a sensible penumbra).
+                    # One random point per sample; accumulation averages it into
+                    # a soft shadow edge.
+                    ldist = (lpos - p).norm()
+                    lpos = lpos + _rand_in_ball() * (ldist * LIGHT_SOFT[None])
                     light_dir = (lpos - p).normalized()
                     shadow_tp = _shadow_throughput(p + n * 1e-3, lpos)
                     diff = ti.max(0.0, n.dot(light_dir))
@@ -3134,7 +3820,7 @@ def render_sample(
                     spec = specular_k * (ti.max(0.0, n.dot(half_v)) ** shininess)
                     direct += (diff * col + spec) * lcol * lbri * shadow_tp
 
-                for si in range(n_spots):
+                for si in range(n_spots_eff):
                     spos = SPOT_POS[si]
                     sdir = SPOT_DIR[si]
                     scol = SPOT_COLOR[si]
@@ -3142,6 +3828,8 @@ def render_sample(
                     cos_outer = SPOT_COS_OUTER[si]
                     cos_inner = SPOT_COS_INNER[si]
 
+                    sdist = (spos - p).norm()
+                    spos = spos + _rand_in_ball() * (sdist * LIGHT_SOFT[None])
                     light_dir = (spos - p).normalized()
                     # angle between the cone's direction (sdir) and the direction FROM the light TO point p
                     cos_theta = (-light_dir).dot(sdir)
@@ -3164,7 +3852,18 @@ def render_sample(
                     # 1.0 everywhere), 1 = the full computed multiplier, >1 = even
                     # punchier streaks/shadows than the raw photon density gives.
                     caustic_mult = 1.0 + (raw_mult - 1.0) * caustic_strength
-                local = ambient_term + direct * caustic_mult
+                glass_E = vec3(0.0)
+                if N_GC[None] > 0 and GLASS_STRENGTH[None] != 0.0:
+                    # Signed (real - straight) photon irradiance from glass -- see
+                    # compute_glass_caustics. Albedo-tinted like any diffuse light.
+                    glass_E = _sample_glass_caustic(p, n) * GLASS_STRENGTH[None]
+                em_E = vec3(0.0)
+                if N_EM[None] > 0 and EM_STRENGTH[None] != 0.0 and not is_unlit:
+                    # Emissive faces light the scene too (see _sample_emissive_light).
+                    em_E = _sample_emissive_light(p, n) * EM_STRENGTH[None]
+                local = ambient_term + direct * caustic_mult + col * (glass_E + em_E)
+                if is_unlit:
+                    local = vec3(0.0)
                 # NOTE: no longer hard-clamped to 1.0 here (only lower-bounded).
                 # Strong highlights (bright specular + a punchy sky/caustic) are
                 # allowed to go above "1.0" and are compressed later by the
@@ -4389,6 +5088,46 @@ def _compute_video_frame_plan(camera_path, fps, duration, camera_sync):
     return n_frames, frame_times, total_time, camera_sync
 
 
+def merge_glass_spheres(spheres, max_clusters=MAX_GLASS_CLUSTERS, pad=1.05):
+    """Merges overlapping bounding spheres (so photons aimed at neighbouring
+    glass blocks aren't counted twice where their discs overlap) and then, if
+    there are still more than max_clusters, the closest pairs until it fits."""
+    sp = [(np.asarray(c, dtype=np.float64), float(r) * pad) for c, r in spheres]
+
+    def enclose(a, b):
+        (c1, r1), (c2, r2) = a, b
+        d = float(np.linalg.norm(c2 - c1))
+        if d + r2 <= r1:
+            return a
+        if d + r1 <= r2:
+            return b
+        R = (d + r1 + r2) / 2.0
+        return (c1 + (c2 - c1) * ((R - r1) / d), R)
+
+    def merge_pass(only_overlapping):
+        best = None
+        for i in range(len(sp)):
+            for j in range(i + 1, len(sp)):
+                gap = float(np.linalg.norm(sp[i][0] - sp[j][0])) - sp[i][1] - sp[j][1]
+                if only_overlapping and gap >= 0.0:
+                    continue
+                if best is None or gap < best[0]:
+                    best = (gap, i, j)
+        if best is None:
+            return False
+        _, i, j = best
+        merged = enclose(sp[i], sp[j])
+        sp.pop(j); sp.pop(i)
+        sp.append(merged)
+        return True
+
+    while len(sp) > 1 and merge_pass(True):
+        pass
+    while len(sp) > max_clusters and merge_pass(False):
+        pass
+    return sp
+
+
 class RayTracer:
     def __init__(self, scene: Scene, width=480, height=480, fov=60,
                  max_bounce=DEFAULT_MAX_BOUNCE, background=None, lights=None, spotlights=None,
@@ -4434,6 +5173,8 @@ class RayTracer:
         self.shininess = 64.0
         self.sky_light_strength = 0.5   # hemispherical sky-fill strength (see render_sample)
         self.caustic_strength = 1.0     # runtime contrast dial on top of CAUSTIC_MAX_MULT
+        self.light_softness = 0.012     # light angular radius (tan): ~0.7 deg, about the real sun's
+                                        # size -> soft penumbrae. 0 = old razor-sharp point-light shadows.
 
         # --- Exposure / eye-adaptation (see render_video's autoexposure block) ---
         # `exposure` is the value actually fed to the tonemapper every frame.
@@ -4467,6 +5208,18 @@ class RayTracer:
             print(f"Warning: {len(scene.water_blocks)} water blocks (non-rotated) but caustics "
                   f"only support up to {MAX_WATER_BLOCKS} blocks -- the rest will be ignored.")
         self.caustics_enabled = True
+        # Glass caustics (photon pass for glass solids -- see compute_glass_caustics).
+        # Emissive faces (screens/lamps) as area lights, and video playback state.
+        self.emissive_lighting_enabled = True   # False = glow is visible but lights nothing else
+        self.emissive_light_strength = 1.0      # runtime dial on the light emissive faces cast
+        self.video_playing = True               # SPACE toggles this in the live view
+        self.video_time = 0.0                   # shared playback clock for every video plane (s)
+        self.glass_caustics_enabled = True
+        self.glass_caustic_strength = 1.0
+        self.glass_caustic_photons = 65536   # photons per (glass cluster, light); 5-10x for final renders
+        self.glass_caustic_reach = 6.0       # receiver map half-size = reach * cluster radius
+        self._glass_sig = None
+        alloc_glass_fields()
         alloc_water_fields()
         self._sync_water_blocks()
         self.compute_caustics()
@@ -4577,6 +5330,7 @@ class RayTracer:
         self.lights.append(light)
         self.sun_light = light  # so set_sun_angle can find and move it later
         self.sync_lights()
+        self.compute_glass_caustics()   # glass caustics need to know about the new light
         return light
 
     def add_sun(self, azimuth_deg=45.0, elevation_deg=35.0, color=(255, 244, 214),
@@ -4651,6 +5405,7 @@ class RayTracer:
             dy = math.sin(elr)
             self.sun_light.position = np.array([dx, dy, dz], dtype=np.float64) * distance
             self.sync_lights()
+            self.compute_glass_caustics()
         self.reset_accumulation()
 
     def set_sun_appearance(self, **kwargs):
@@ -4988,11 +5743,99 @@ class RayTracer:
         WB_IOR.from_numpy(iors)
         N_WATER_FIELD[None] = n
 
+    # --- Video playback ---------------------------------------------------
+    @property
+    def has_videos(self):
+        return bool(self.scene.textures.videos)
+
+    def set_video_time(self, t):
+        """Shows each video at playback time t (seconds, looping). Decodes + uploads a
+        texture ONLY for videos whose frame actually changed, so calling this every
+        frame is cheap. Returns True if anything changed (callers should then restart
+        progressive accumulation). Deterministic in t -- offline renders rely on that."""
+        self.video_time = float(t)
+        changed = False
+        for tex_id, src in self.scene.textures.videos.items():
+            idx = src.index_at(self.video_time)
+            if idx == src.uploaded_idx:
+                continue
+            arr = src.frame(idx)
+            if arr is None:
+                continue
+            upload_texture_u8(tex_id, arr)
+            src.uploaded_idx = src.cur_idx      # after wrap-learning this may differ from idx
+            changed = True
+        return changed
+
+    def update_videos(self, dt):
+        """Live-view tick: advances the shared clock by dt while playing (paused =
+        the clock and every frame stay put). True if a new frame was uploaded."""
+        if not self.has_videos or not self.video_playing:
+            return False
+        return self.set_video_time(self.video_time + dt)
+
+    def toggle_video_playback(self):
+        if not self.has_videos:
+            return None
+        self.video_playing = not self.video_playing
+        print(f"Video: {'playing' if self.video_playing else 'paused'} at {self.video_time:.2f}s")
+        return self.video_playing
+
+    def _glass_signature(self):
+        r = lambda a: tuple(round(float(x), 3) for x in np.asarray(a).ravel())
+        return (self.glass_caustic_photons, round(self.glass_caustic_reach, 3),
+                len(self.scene.glass_blocks),
+                tuple((r(l.position), r(l.color), round(l.brightness, 3)) for l in self.lights),
+                tuple((r(s.position), r(s.direction), r(s.color), round(s.brightness, 3),
+                       round(s.cone_angle, 2), round(s.softness, 3)) for s in self.spotlights))
+
+    def compute_glass_caustics(self, force=False):
+        """Photon pass for glass solids (see the comment block above
+        _gc_trace). Cheap to call repeatedly: it returns immediately unless
+        the lights/photon settings changed since the last run (or force).
+        Prints its own timing so you can see the real cost on your hardware."""
+        if not self.glass_caustics_enabled or not self.scene.glass_blocks:
+            N_GC[None] = 0
+            return
+        sig = self._glass_signature()
+        if not force and sig == self._glass_sig:
+            return
+        self._glass_sig = sig
+        t0 = time.time()
+        spheres = [(c, r) for c, r in merge_glass_spheres(self.scene.glass_blocks)
+                   if r <= GLASS_MAX_CLUSTER_RADIUS]
+        n = len(spheres)
+        n_lights, n_spots = len(self.lights), len(self.spotlights)
+        if n == 0 or (n_lights + n_spots) == 0:
+            N_GC[None] = 0
+            return
+        centers = np.zeros((MAX_GLASS_CLUSTERS, 3), dtype=np.float32)
+        radii = np.zeros(MAX_GLASS_CLUSTERS, dtype=np.float32)
+        for i, (c, r) in enumerate(spheres):
+            centers[i], radii[i] = c, r
+        GC_CENTER.from_numpy(centers)
+        GC_RADIUS.from_numpy(radii)
+        GC_HALF.from_numpy((radii * float(self.glass_caustic_reach)).astype(np.float32))
+        N_GC[None] = n
+        glass_probe_receivers(n)
+        GLASS_ACC.fill(0.0)
+        self.sync_lights()
+        glass_caustics_kernel(n, n_lights, n_spots, int(self.glass_caustic_photons))
+        # two separable [1 2 1] blur passes: ACC -> TMP -> MAP -> TMP -> MAP
+        glass_blur_h(n, GLASS_ACC, GLASS_TMP)
+        glass_blur_v(n, GLASS_TMP, GLASS_MAP)
+        glass_blur_h(n, GLASS_MAP, GLASS_TMP)
+        glass_blur_v(n, GLASS_TMP, GLASS_MAP)
+        ti.sync()
+        print(f"Glass caustics: {n} cluster(s), {n_lights} light(s) + {n_spots} spot(s), "
+              f"{int(self.glass_caustic_photons)} photons each -> {(time.time() - t0) * 1000:.0f} ms")
+
     def compute_caustics(self):
         """Recomputes the caustic map (photon pre-pass). Called once at
         startup, and again whenever a point Light's position changes (e.g.
         after pressing K) -- does NOT depend on image resolution so it does
         not need to be recomputed when switching between live/final resolution."""
+        self.compute_glass_caustics()   # no-op unless lights/settings changed (see its docstring)
         n_water = len(self.water_blocks)
         n_lights = len(self.lights)
         n_spots = len(self.spotlights)
@@ -5091,6 +5934,9 @@ class RayTracer:
         cp = self.camera_pos
         self.sync_lights()
         WATER_TIME[None] = float(self.water_time)
+        LIGHT_SOFT[None] = float(self.light_softness)
+        EM_STRENGTH[None] = float(self.emissive_light_strength) if self.emissive_lighting_enabled else 0.0
+        GLASS_STRENGTH[None] = float(self.glass_caustic_strength) if self.glass_caustics_enabled else 0.0
         for _ in range(n_samples):
             render_sample(
                 float(cp[0]), float(cp[1]), float(cp[2]),
@@ -5323,6 +6169,9 @@ class RayTracer:
         animate_caustics = (WATER_ANIMATE_CAUSTICS and self.water_blocks
                              and (self.lights or self.spotlights))
         last_caustic_t = None
+        # Videos in the scene auto-play from t=0 along the OUTPUT timeline (looping), no
+        # matter whether the live view had them paused. Remember the live state to restore.
+        _video_state_before = (self.video_time, self.video_playing)
 
         sync_note = " (camera-sync: 1 frame/sample)" if camera_sync else ""
         n_render = len(frame_range)
@@ -5399,6 +6248,8 @@ class RayTracer:
                         # SensorCameraData._raw_sample_quat).
                         self.camera_quat = q
                         self.water_time = tt * WATER_WAVE_SPEED
+                        if self.has_videos:
+                            self.set_video_time(tt)   # uploads only if this sub-sample crossed a video frame
                         # Sample spotlight animations at this exact
                         # sub-frame shutter time too, so an animated
                         # spotlight motion-blurs consistently with the
@@ -5418,6 +6269,8 @@ class RayTracer:
                     self.camera_pos = pos.astype(np.float32)
                     self.camera_quat = q
                     self.water_time = t_center * WATER_WAVE_SPEED
+                    if self.has_videos:
+                        self.set_video_time(t_center)
                     # Deterministic, frame-exact spotlight animation (see
                     # SpotLightAnimation) -- NOT wall-clock based like the
                     # interactive view, so re-rendering the same video is
@@ -5493,6 +6346,9 @@ class RayTracer:
         self.water_time = 0.0
         self.camera_roll = 0.0
         WATER_TIME[None] = 0.0
+        if self.has_videos:
+            self.video_playing = _video_state_before[1]
+            self.set_video_time(_video_state_before[0])   # back to wherever the live view was
         if animate_caustics:
             self.compute_caustics()  # restore the still (t=0) caustic map, as before rendering video
 
@@ -6035,7 +6891,7 @@ DEFAULT_POST_FX = {
     'fog_height_falloff': 0.0,    # 0 = uniform fog at all heights, >0 = fog thins out above fog_base_height
                                    # (an exponential falloff in world Y, like ground mist/haze layers)
     'fog_base_height': 0.0,       # world Y the height falloff is measured from (ignored if fog_height_falloff is 0)
-    'godrays_enabled': True,      # screen-space crepuscular rays / light shafts from visible lights through sky
+    'godrays_enabled': False,      # screen-space crepuscular rays / light shafts from visible lights through sky
     'godrays_intensity': 0.35,    # additive strength of the ray contribution
     'godrays_decay': 0.97,        # per-sample falloff along each ray (closer to 1 = rays reach further)
     'godrays_density': 0.9,       # sample step size as a fraction of the full source->pixel distance
@@ -6056,11 +6912,11 @@ DEFAULT_POST_FX = {
                                    # "flat, milky" low-DR look of a small CCD sensor (0 = full range, off)
     'analog_highlight_clip': 0.28,# 0..1 -- how little headroom highlights get before blowing out to a hard,
                                    # detail-less white (lower = blows out sooner/harder)
-    'analog_grain': 0.01,         # grain amount (0..~0.15), stronger in shadows/midtones than highlights
+    'analog_grain': 0.00,         # grain amount (0..~0.15), stronger in shadows/midtones than highlights
     'analog_grain_size': 1.6,     # grain "clump" size in px -- 1 = fine per-pixel noise, >1 = coarser blobs
                                    # closer to real CCD/tape noise than flat per-pixel grain
     'analog_halation': 0.3,       # warm red-orange bleed around bright/blown-out highlights (0 = off)
-    'analog_vignette': 0.4,       # soft optical vignette strength (0..~1)
+    'analog_vignette': 0.2,       # soft optical vignette strength (0..~1)
     'analog_warmth': 0.00,        # warm-highlight/cool-shadow split-tone strength (0 = neutral)
     'analog_smear': 0.6,          # extra DIRECTIONAL motion smear, sized from the camera's actual frame-to-
                                    # frame movement (rotation dominates, like a handheld camcorder) -- video
@@ -7333,6 +8189,9 @@ def _embed_asset(assets: dict, path):
         return
     with open(path, 'rb') as f:
         data = f.read()
+    if len(data) > 25 * 1024 * 1024:
+        print(f"Note: embedding '{path}' ({len(data) / 1048576:.0f} MB) into the scene file -- "
+              f"use --no-embed-assets to reference it by path instead.")
     assets[path] = {
         'filename': os.path.basename(path),
         'data_b64': base64.b64encode(data).decode('ascii'),
@@ -7762,22 +8621,28 @@ def build_mc_scene(schem_path="lim_c.schem", decal_path="miku_wonder.png"):
 
 def build_custom_scene():
     scene = Scene()
-    water_f_pos = (-15, 3.8, 30)
-    water_s_pos = (-47, 0, -31)
-    water_size = (
-        abs(water_f_pos[0] - water_s_pos[0]),
-        abs(water_f_pos[1] - water_s_pos[1]),
-        abs(water_f_pos[2] - water_s_pos[2]),
-    )
-    water_center = (
-        min(water_f_pos[0], water_s_pos[0]) + water_size[0] / 2,
-        min(water_f_pos[1], water_s_pos[1]) + water_size[1] / 2,
-        min(water_f_pos[2], water_s_pos[2]) + water_size[2] / 2,
-    )
-    scene.add_water(center=water_center, size=water_size, color=(120, 220, 240), transparency=0.8)
-    scene = load_schematic("/home/khang238/Documents/python/watar.schem", scene)
-    scene.add_image((-18.6, 4.32, -7), (2.10, 4), "osage.png", rotation=(math.radians(90), 0, 0), roughness=0.15, reflection_k=0.05)
-    # scene.add_image((-11, 5.98, -4), (1.63, 4), "miku_wonder.png", rotation=(math.radians(90), 0, 0), roughness=0.15, reflection_k=0.05)
+    scene = load_schematic("lim_c.schem", Scene())
+    scene.add_image((0, 9.95, 4.48), (1.63, 4), "miku_wonder.png",
+                     rotation=(0, 0, 0),
+                     roughness=0.15, reflection_k=0.05)
+    scene.add_box((-1, 8.95, 4.6), (0.8, 0.95, 0.8), (150, 82, 14), roughness=0.9)
+    scene.add_box((-1, 9, 4.1), (1, 1, 0.2), (8, 2, 6), roughness=0.9)
+    scene.add_box((-1, 8.25, 4.5), (1.1, 0.5, 1.1), (22, 25, 23), roughness=0.9)
+    scene.add_box((-0.55, 8.6, 3.955), (0.05, 0.05, 0.05), (0, 255, 0), emissive=8.0)
+    scene.add_video((-1, 9, 3.99), (0.9, None), "wonder.mp4", emissive=1)
+
+    # --- Emissive (self-illuminated) objects: the box glows in its own colour AND lights
+    #     nearby surfaces like an area light. 1.0 = full colour brightness; 3-6 = a lamp.
+    #scene.add_box((3.0, 1.0, 3.0), (0.6, 0.6, 0.6), (255, 170, 80), emissive=4.0)
+    # scene.add_box((3.0, 1.0, 5.0), (0.6, 0.6, 0.6), (40, 40, 40), emissive=3.0,
+    #               emissive_color=(80, 160, 255))        # dark box that glows blue
+    # --- Looping video "screen" (SPACE pauses/plays in the live view; auto-plays in video
+    #     renders). Glows + lights the scene with whatever is on screen. Height is taken
+    #     from the video's aspect ratio when you pass h=None:
+    #scene.add_video((0.0, 3.0, 8.0), (6.0, None), "wonder.mp4")
+    # scene.add_video((0.0, 3.0, 8.0), (6.0, None), "clip.mp4", rotation=(3.1416, 0, 0))  # facing the other way
+    # scene.add_video(..., emissive=0, unlit=False)         # plain lit video texture, no glow
+
     return scene
 
 # =============================================================================
@@ -8303,6 +9168,13 @@ def _build_world_params(tracer, post_fx, camera_path, has_camera_data):
 
     add("[C] Caustics enabled", lambda: tracer.caustics_enabled,
         lambda v: setattr(tracer, 'caustics_enabled', v), 'bool')
+    add("  Emissive light strength", lambda: tracer.emissive_light_strength,
+        lambda v: setattr(tracer, 'emissive_light_strength', max(0.0, v)), 'float', 0.1, 0.0, 10.0)
+    if tracer.has_videos:
+        add("  Video playing (SPACE)", lambda: bool(tracer.video_playing),
+            lambda v: setattr(tracer, 'video_playing', bool(v)), 'bool')
+    add("  Glass caustic strength", lambda: tracer.glass_caustic_strength,
+        lambda v: setattr(tracer, 'glass_caustic_strength', v), 'float', 0.1, 0.0, 5.0)
     add("  Caustic strength", lambda: tracer.caustic_strength,
         lambda v: setattr(tracer, 'caustic_strength', v), 'float', 0.1, 0.0, 5.0)
 
@@ -8797,6 +9669,24 @@ def parse_args(argv=None):
                          "without discarding its settings -- the scene keeps its angle/color/size, "
                          "so it can be switched back on from the F5 world menu. Also toggleable "
                          "there at any time.")
+    p.add_argument('--no-glass-caustics', action='store_true',
+                    help="Disable the glass-caustic photon pass (light bunching/shifting through glass "
+                         "solids). Per-frame cost is tiny either way; this skips the one-off pass.")
+    p.add_argument('--glass-photons', type=int, default=None,
+                    help="Photons per (glass cluster, light) for the glass-caustic pass (default 65536). "
+                         "Raise (e.g. 500000) for cleaner final stills; lower for faster startup.")
+    p.add_argument('--video-time', type=float, default=0.0,
+                    help="Playback time (seconds) the scene's video planes start at -- the frame shown "
+                         "in stills (--headless without --video) and when the interactive view opens. "
+                         "Loops past the video's end. Video renders always start from 0 and play along "
+                         "the output timeline.")
+    p.add_argument('--video-start-paused', action='store_true',
+                    help="Open the interactive view with video planes paused (SPACE plays/pauses).")
+    p.add_argument('--texture-size', type=int, default=None,
+                    help="Resolution (pixels per side, default 512) every texture and video frame is "
+                         "resized to. Raise (e.g. 1024) for sharper video planes at the cost of GPU memory.")
+    p.add_argument('--no-emissive-light', action='store_true',
+                    help="Emissive faces/video screens still glow, but don't light other surfaces.")
     p.add_argument('--no-stars', action='store_true',
                     help="Hide the star field without discarding its settings (density/seed/sizes "
                          "are kept) -- toggleable again from the F5 world menu.")
@@ -8935,15 +9825,19 @@ def main(argv=None):
     MAX_W = max(MAX_W, FINAL_RENDER_RES[0], PREVIEW_RES[0], LIVE_RENDER_RES[0])
     MAX_H = max(MAX_H, FINAL_RENDER_RES[1], PREVIEW_RES[1], LIVE_RENDER_RES[1])
 
+    if args.texture_size:
+        TextureLibrary.TEX_SIZE = max(64, int(args.texture_size))   # before any scene loads textures
+
     loaded = None
     if args.scene:
         loaded = load_scene_file(args.scene)
         scene = loaded['scene']
     elif args.mc_schem:
-        # scene = build_mc_scene(schem_path=args.mc_schem)
-        scene = build_custom_scene()
+        scene = build_mc_scene(schem_path=args.mc_schem)
+        # scene = build_custom_scene()
     else:
-        scene = build_demo_scene()
+        scene = build_custom_scene()
+        #scene = build_demo_scene()
     print(f"Scene: {len(scene.faces)} faces ({len(scene.boxes)} boxes, {len(scene.quads)} image planes)")
 
     if loaded is not None:
@@ -8964,17 +9858,12 @@ def main(argv=None):
         eye_adapt_enabled = loaded['eye_adapt_enabled']
         eye_adapt_speed = loaded['eye_adapt_speed']
     else:
-        bg = Background(color=(20, 25, 35), brightness=1.0)
-        bg.set_sky_gradient(
-            zenith_color=(5, 12, 30),
-            horizon_color=(35, 55, 85),
-            ground_color=(10, 12, 18),
-            curve=0.4,
-            resolution=(2000, 1000)
-        )
+        bg = Background(color=(20, 25, 35), image_path="sky2.png", brightness=1.0)
+        #bg.set_sky_gradient(zenith_color=(5, 12, 30), horizon_color=(35, 55, 85), ground_color=(10, 12, 18), curve=0.4, resolution=(2000, 1000))
+        #bg.set_sky_gradient(curve=0.2, resolution=(2000, 1000))
         lights = [
-            #Light((-18.41, 29.48, -12.73), (255, 251, 235), 1.1),   # key light, slightly warm
-            #Light((-1.47, -4.69, 6.94), (255, 251, 235), 1.0),      # fill light, cooler blue
+            Light((-18.41, 29.48, -12.73), (255, 251, 235), 1.1),   # key light, slightly warm
+            Light((-1.47, -4.69, 6.94), (120, 160, 200), 1.0),      # fill light, cooler blue
             Light((-5.88, 16.79, -13.09), (255, 251, 235), 0.0),
         ]
         spotlights = [
@@ -9066,6 +9955,17 @@ def main(argv=None):
         tracer.set_star_update_interval(args.star_update_interval)
     if args.no_sun:
         tracer.set_sun_enabled(False)
+    if args.no_emissive_light:
+        tracer.emissive_lighting_enabled = False
+    if tracer.has_videos:
+        tracer.set_video_time(args.video_time)
+        if args.video_start_paused:
+            tracer.video_playing = False
+    if args.no_glass_caustics:
+        tracer.glass_caustics_enabled = False
+    if args.glass_photons is not None:
+        tracer.glass_caustic_photons = max(1024, int(args.glass_photons))
+    tracer.compute_glass_caustics()
     if args.no_stars:
         tracer.set_stars_enabled(False)
 
@@ -9563,6 +10463,9 @@ def main(argv=None):
                 any_input = True
             elif ch == 'esc':
                 running = False
+            elif ch == ' ' and inp.one_shot('video_toggle'):
+                # Play/pause EVERY video plane at once (they share one clock).
+                tracer.toggle_video_playback()
             elif ch == '1' and inp.one_shot('lines'):
                 lines_mode = not lines_mode
             elif ch == 'l' and inp.one_shot('live'):
@@ -9823,6 +10726,13 @@ def main(argv=None):
         # call unconditionally -- it's a no-op for any spotlight that
         # doesn't have one attached.
         if tracer.spotlights and tracer.update_spotlight_animations(frame_dt):
+            any_input = True
+
+        # Video planes: advance the shared playback clock by this frame's wall-clock delta
+        # (no-op while paused or when the scene has no video) and, if a new video frame was
+        # uploaded, restart progressive accumulation like any other animated change. While
+        # paused nothing triggers, so the accumulated image keeps converging as usual.
+        if live_render and tracer.update_videos(frame_dt):
             any_input = True
 
         # Cloud drift/billow (see set_cloud_drift/sample_cloud_drift):
