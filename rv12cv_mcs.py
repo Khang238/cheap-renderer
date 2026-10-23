@@ -626,7 +626,7 @@ def normalize(v):
 
 PREVIEW_RES = (960, 540)         # window size + 2D painter's-algorithm preview
 LIVE_RENDER_RES = (96, 54)       # interactive raytrace resolution (upscaled to window)
-FINAL_RENDER_RES = (3840, 2160)  # final image (the '9' key), saved to file
+FINAL_RENDER_RES = (1920, 1080)  # final image (the '9' key), saved to file
 MAX_W, MAX_H = FINAL_RENDER_RES
 
 MAX_LIGHTS = 8
@@ -664,6 +664,11 @@ VIDEO_DURATION = 17.0             # seconds -- ONLY used when there is EXACTLY 1
 VIDEO_SAMPLES_PER_FRAME = 16       # raytrace samples per video frame
 
 # --- WATER MOTION IN VIDEO (does not affect stills/live) ---------------
+WATER_LOOP_FRAMES = 681          # water is a SEAMLESS LOOP of exactly this many video frames
+                                 # (681 / VIDEO_FPS = ~22.72 s). Every water time-frequency
+                                 # below is an integer multiple of W0, so frame N == frame 0.
+                                 # Keep WATER_WAVE_SPEED = 1.0 and render N*681 frames.
+W0 = 2.0 * math.pi * VIDEO_FPS / WATER_LOOP_FRAMES   # rad/s, base loop frequency
 WATER_WAVE_SPEED = 1.0          # multiplier applied to the "time" fed into the water
                                  # ripple function when rendering video -- 0 = water stays
                                  # still like before, 1 = default speed, higher = faster
@@ -2841,8 +2846,8 @@ def _get_water_normal(p: vec3, base_n: vec3) -> vec3:
         # pattern doesn't look like a perfectly regular grid of crossed sine
         # waves -- real chop is never that tidy. Cheap (2 extra sin/cos) and
         # only nudges sample position slightly.
-        warp_x = x + 0.6 * ti.sin(z * 0.07 + t * 0.11)
-        warp_z = z + 0.6 * ti.cos(x * 0.065 - t * 0.09)
+        warp_x = x + 0.6 * ti.sin(z * 0.07 + t * W0)
+        warp_z = z + 0.6 * ti.cos(x * 0.065 - t * W0)
 
         # Sum of several Gerstner waves at different frequencies, amplitudes,
         # directions and speeds (directions are intentionally NOT axis-aligned
@@ -2856,12 +2861,12 @@ def _get_water_normal(p: vec3, base_n: vec3) -> vec3:
         dispx = 0.0
         dispz = 0.0
 
-        d0x, d0z, r0x, r0z = _gerstner_wave(warp_x, warp_z, t,  0.80,  0.60, 0.35, 0.22, 0.55, 0.35)
-        d1x, d1z, r1x, r1z = _gerstner_wave(warp_x, warp_z, t, -0.35,  0.94, 0.55, 0.14, 0.80, 0.30)
-        d2x, d2z, r2x, r2z = _gerstner_wave(warp_x, warp_z, t,  0.94,  0.34, 0.95, 0.075, 1.15, 0.28)
-        d3x, d3z, r3x, r3z = _gerstner_wave(warp_x, warp_z, t, -0.60, -0.80, 1.7, 0.04, 1.6, 0.22)
-        d4x, d4z, r4x, r4z = _gerstner_wave(warp_x, warp_z, t,  0.20, -0.98, 3.1, 0.018, 2.3, 0.18)
-        d5x, d5z, r5x, r5z = _gerstner_wave(warp_x, warp_z, t, -0.86,  0.51, 5.4, 0.008, 3.1, 0.12)
+        d0x, d0z, r0x, r0z = _gerstner_wave(warp_x, warp_z, t,  0.80,  0.60, 0.35, 0.22, 2.0 * W0, 0.35)
+        d1x, d1z, r1x, r1z = _gerstner_wave(warp_x, warp_z, t, -0.35,  0.94, 0.55, 0.14, 3.0 * W0, 0.30)
+        d2x, d2z, r2x, r2z = _gerstner_wave(warp_x, warp_z, t,  0.94,  0.34, 0.95, 0.075, 4.0 * W0, 0.28)
+        d3x, d3z, r3x, r3z = _gerstner_wave(warp_x, warp_z, t, -0.60, -0.80, 1.7, 0.04, 6.0 * W0, 0.22)
+        d4x, d4z, r4x, r4z = _gerstner_wave(warp_x, warp_z, t,  0.20, -0.98, 3.1, 0.018, 8.0 * W0, 0.18)
+        d5x, d5z, r5x, r5z = _gerstner_wave(warp_x, warp_z, t, -0.86,  0.51, 5.4, 0.008, 11.0 * W0, 0.12)
 
         dhdx = d0x + d1x + d2x + d3x + d4x + d5x
         dhdz = d0z + d1z + d2z + d3z + d4z + d5z
@@ -2870,8 +2875,8 @@ def _get_water_normal(p: vec3, base_n: vec3) -> vec3:
         # texture) so dead-flat patches between the low-frequency swells
         # still show some sparkle/micro-ripple, like real water never being
         # perfectly glassy.
-        jit_x = 0.006 * ti.sin(warp_x * 9.7 + warp_z * 6.1 + t * 4.3)
-        jit_z = 0.006 * ti.cos(warp_z * 8.9 - warp_x * 7.3 + t * 3.7)
+        jit_x = 0.006 * ti.sin(warp_x * 9.7 + warp_z * 6.1 + t * 16.0 * W0)
+        jit_z = 0.006 * ti.cos(warp_z * 8.9 - warp_x * 7.3 + t * 13.0 * W0)
 
         wave_n = vec3(-(dhdx + jit_x), base_n[1], -(dhdz + jit_z)).normalized()
         res = wave_n
@@ -10116,7 +10121,7 @@ _MC_COLORS = {
     'purple': (137, 50, 184),
     'brown': (131, 84, 50),
     'green': (94, 124, 22),
-    'red': (176, 46, 38),
+    'red': (255, 0, 0),
     'black': (29, 29, 33),
     # Minecraft's water color (kept in sync with the demo scene)
     'water': (120, 220, 240),
@@ -10376,10 +10381,63 @@ def build_custom_scene():
     scene = Scene()
     
     #scene.add_box((0, -1, 0), (60, 1, 60), (200, 200, 205), roughness=0.35)
-    scene.add_water_surface(0)
-    scene.add_image((0, 2.4, 0), (15.5, 5), "larp.png", emissive=4)
-    scene.add_image((8.5, 0.9, -0.1), (0.81, 2), "miku_wonder.png")
+    #scene.add_water_surface(0)
+    #scene.add_image((0, 2.4, 0), (15.5, 5), "larp.png", emissive=4)
+    #scene.add_image((8.5, 0.9, -0.1), (0.81, 2), "miku_wonder.png")
     
+    #scene.add_water_surface(0)
+    #scene.add_box((0, 2.48, 5), (10, 5, 1), (255, 255, 255))
+    #scene.add_image((0, 2.48, 4.49), (None, 5), "screenshot.png")
+    #scene.add_image((-5.2, 0.9, 4), (None, 1.8), "osage_cheer.png")
+    #scene.add_image((4.6, 0.9, 4), (None, 1.8), "osage_cheer.png")
+
+    scene.add_box((0, -40.5, 0), (240, 1, 240), (200, 200, 205), roughness=0.35)
+    scene.add_box((-6, 4, 0), (6, 8, 6), (235, 245, 255), roughness=0.0,
+                  transparency=0.95, ior=1.5)
+    scene.add_box((4, 3, -6), (5, 6, 5), (180, 60, 60), roughness=0.0,
+                  transparency=0.9, ior=1.45)
+    scene.add_box((8, 3, 4), (6, 6, 6), (230, 200, 90), roughness=0.02,
+                  reflection_k=0.9)
+    scene.add_box((-8, 2.5, 8), (5, 5, 5), (210, 210, 220), roughness=0.15,
+                  reflection_k=0.8)
+    scene.add_box((0, 2, -10), (4, 4, 4), (200, 60, 60), roughness=0.9)
+
+    scene.add_box((-2, 3, 14), (4, 4, 4), (90, 140, 220), roughness=0.25,
+                  rotation=(math.radians(30), math.radians(15), 0))
+
+    demo_tex = os.path.join(os.path.dirname(os.path.abspath(__file__)), "miku_wonder.png")
+    try:
+        scene.add_image((0, 5.2, 8), (4.9, 12), demo_tex,
+                         rotation=(0, 0, 0),
+                         roughness=0.15, reflection_k=0.05)
+    except FileNotFoundError as e:
+        print(f"(Skipping demo texture: {e} -- replace with your own image path in build_demo_scene())")
+
+    demo_tex = os.path.join(os.path.dirname(os.path.abspath(__file__)), "osage.png")
+    try:
+        scene.add_image((-6.2, 8.4, -3.12), (4.20, 8), demo_tex,
+                         rotation=(0, 0, 0),
+                         roughness=0.15, reflection_k=0.05)
+    except FileNotFoundError as e:
+        print(f"(Skipping demo texture: {e} -- replace with your own image path in build_demo_scene())")
+
+    scene.add_water(
+        center=(0, -19, 0),
+        size=(240, 40, 240),
+        color=(120, 220, 240),
+        transparency=0.02
+    )
+
+    scene.add_minecraft_character(
+    "skin.png", position=(4, 6, -6), rotation=(0, 0, 0), degrees=True,
+    pose={'head': (20, 10, 0),      
+          'right_arm': (0, 0, -150),
+          'left_arm': 35,           
+          'left_leg': (0, -25, 0)},
+    scale=1/4
+    )
+    scene.add_box((0, 1.5, -2), (2, 4, 2), (220, 50, 50), roughness=0.5)
+
 
     return scene
 
@@ -11778,11 +11836,11 @@ def main(argv=None):
         loaded = load_scene_file(args.scene)
         scene = loaded['scene']
     elif args.mc_schem:
-        #scene = build_mc_scene(schem_path=args.mc_schem)
-        scene = build_custom_scene()
-    else:
+        scene = build_mc_scene(schem_path=args.mc_schem)
         #scene = build_custom_scene()
-        scene = build_demo_scene()
+    else:
+        scene = build_custom_scene()
+        #scene = build_demo_scene()
 
     # --- Minecraft skin (--skin): either a standalone showcase scene or one more object in
     #     whatever scene was just built/loaded. A freshly built scene is the only case where
@@ -11831,7 +11889,7 @@ def main(argv=None):
             # (add_sun/add_stars below need a sky image to paint on): use the built-in gradient.
             bg.set_sky_gradient(resolution=(1024, 512))
 
-        #bg.set_sky_gradient(zenith_color=(5, 12, 30), horizon_color=(35, 55, 85), ground_color=(10, 12, 18), curve=0.4, resolution=(2000, 1000))
+        #bg.set_sky_gradient(zenith_color=(5, 12, 30), horizon_color=(35, 55, 85), ground_color=(10, 12, 18), curve=0.4, resolution=(600, 400))
         #bg.set_sky_gradient(curve=0.2, resolution=(2000, 1000))
         lights = [
             #Light((-18.41, 29.48, -12.73), (255, 251, 235), 1.1),   # key light, slightly warm
@@ -11842,6 +11900,7 @@ def main(argv=None):
             #SpotLight((0.0, 20.0, -5.0), (0.15, -1.0, 0.25), color=(16, 255, 255), brightness=0.3, cone_angle=14.0, softness=0.04),
             #SpotLight((0.0, 20.0, -5.0), (0.15, -1.0, 0.25), color=(255, 16, 255), brightness=0.3, cone_angle=14.0, softness=0.04),
             #SpotLight((0.0, 20.0, -5.0), (0.15, -1.0, 0.25), color=(255, 255, 16), brightness=0.3, cone_angle=14.0, softness=0.04),
+            #SpotLight((0.0, 20.0, -5.0), (0.15, -1.0, 0.25), color=(255, 255, 255), brightness=0.3, cone_angle=14.0, softness=0.04),
         ]
         fov = 65
         max_bounce = DEFAULT_MAX_BOUNCE
