@@ -8156,7 +8156,7 @@ def apply_god_rays(img, depth, flares, post_fx):
     return out
 
 
-def apply_analog_motion_smear(img, motion_px, strength, max_px):
+def apply_analog_motion_smear(img, motion_px, strength, max_px, text_mask=None):
     """Cheap DIRECTIONAL smear standing in for a cheap camcorder's slow
     electronic shutter + CCD charge-smear -- averages several copies of
     `img` shifted along the (dx, dy) apparent-motion vector (in pixels,
@@ -8186,14 +8186,28 @@ def apply_analog_motion_smear(img, motion_px, strength, max_px):
     n_taps = max(3, min(16, int(round(length)) + 3))
     h, w = img.shape[:2]
     src = img.astype(np.float32)
+    # text_mask (HUD text alpha, h x w): text pixels are neither smeared nor smeared INTO their
+    # surroundings -- taps that land on text are dropped from the average (weights renormalised).
+    if text_mask is not None:
+        text_mask = np.clip(text_mask * 3.0, 0.0, 1.0)      # antialiased edge pixels count as text too
+    wsrc = src if text_mask is None else src * (1.0 - text_mask)[..., None]
+    wgt = None if text_mask is None else (1.0 - text_mask).astype(np.float32)
     acc = np.zeros_like(src)
+    wacc = None if text_mask is None else np.zeros((h, w), dtype=np.float32)
     for i in range(n_taps):
         f = (i / (n_taps - 1)) - 0.5  # -0.5 .. +0.5 along the motion vector
         ox, oy = ux * length * f, uy * length * f
         M = np.float32([[1.0, 0.0, ox], [0.0, 1.0, oy]])
-        acc += cv2.warpAffine(src, M, (w, h), flags=cv2.INTER_LINEAR,
+        acc += cv2.warpAffine(wsrc, M, (w, h), flags=cv2.INTER_LINEAR,
                                borderMode=cv2.BORDER_REPLICATE)
-    return acc / n_taps
+        if wacc is not None:
+            wacc += cv2.warpAffine(wgt, M, (w, h), flags=cv2.INTER_LINEAR,
+                                    borderMode=cv2.BORDER_REPLICATE)
+    if text_mask is None:
+        return acc / n_taps
+    ok = wacc > 1e-4
+    smeared = np.where(ok[..., None], acc / np.maximum(wacc, 1e-4)[..., None], src)
+    return smeared * (1.0 - text_mask)[..., None] + src * text_mask[..., None]
 
 
 def _camera_motion_px(prev_pose, curr_pose, w, h, half_tan, aspect):
@@ -8228,7 +8242,7 @@ def _camera_motion_px(prev_pose, curr_pose, w, h, half_tan, aspect):
     return float(v[0]) / vz * focal_px_x, -float(v[1]) / vz * focal_px_y
 
 
-def apply_analog_camera(img, post_fx, frame_seed=0, motion_px=None):
+def apply_analog_camera(img, post_fx, frame_seed=0, motion_px=None, text_mask=None):
     """Y2K-camcorder 'analog camera' look -- deliberately distinct from
     apply_vhs's tape degradation (which simulates a video SIGNAL's
     electronic artifacts: scanlines, tracking wobble, chroma crosstalk).
@@ -8350,7 +8364,8 @@ def apply_analog_camera(img, post_fx, frame_seed=0, motion_px=None):
     # 7) Motion smear (video/live only -- motion_px is None for stills)
     smear = post_fx.get('analog_smear', 0.0) * strength
     if smear > 0.0:
-        out = apply_analog_motion_smear(out, motion_px, smear, post_fx.get('analog_smear_max_px', 40))
+        out = apply_analog_motion_smear(out, motion_px, smear, post_fx.get('analog_smear_max_px', 40),
+                                        text_mask=text_mask)
 
     return out
 
@@ -8367,8 +8382,12 @@ def apply_post_processing(img, depth, flares, post_fx, frame_seed=0, camera_pose
     zoom_kick = float(post_fx.get('_zoom_focal_kick', 0.0))
     if zoom_kick > 1e-4:
         out = apply_zoom_focal_shift(out, zoom_kick)
+    text_mask = None
     if hud is not None and hud.sprites:
         out, depth = hud.blend_float(out, depth)
+        if (post_fx.get('analog_enabled', False) and post_fx.get('analog_smear', 0.0) > 0.0
+                and motion_px is not None):
+            text_mask = hud.alpha_float(*out.shape[:2])
     fisheye_rc = None
     if post_fx.get('fisheye_enabled', False):
         fh, fw = out.shape[:2]
@@ -8377,6 +8396,8 @@ def apply_post_processing(img, depth, flares, post_fx, frame_seed=0, camera_pose
         _fa, _frc = _fisheye_geometry(fw, fh, strength)
         if _fa > 1e-4:
             fisheye_rc = _frc
+            if text_mask is not None:
+                text_mask = apply_fisheye(text_mask, text_mask, strength)[0]
         flares = [(*_fisheye_warp_point(sx, sy, fw, fh, strength), color, brightness)
                   for (sx, sy, color, brightness) in flares]
     out = apply_fog(out, depth, post_fx, camera_pose=camera_pose)
@@ -8391,7 +8412,7 @@ def apply_post_processing(img, depth, flares, post_fx, frame_seed=0, camera_pose
                                 ghosts=post_fx.get('flare_ghosts', 0.0),
                                 starburst=post_fx.get('flare_starburst', 0.0),
                                 blades=post_fx.get('flare_blades', 6))
-    out = apply_analog_camera(out, post_fx, frame_seed=frame_seed, motion_px=motion_px)
+    out = apply_analog_camera(out, post_fx, frame_seed=frame_seed, motion_px=motion_px, text_mask=text_mask)
     if post_fx.get('chroma_enabled', False):
         out = apply_chromatic_aberration(out, post_fx['chroma_strength'])
     if post_fx.get('vhs_enabled', False):
@@ -9113,18 +9134,37 @@ def _gp_analog_b(img: _gp_nd3, glow: _gp_nd3, noise: _gp_nd3, dst: _gp_nd3,
 
 @ti.kernel
 def _gp_smear(img: _gp_nd3, dst: _gp_nd3, w: ti.i32, h: ti.i32,
-              ux: ti.f32, uy: ti.f32, length: ti.f32, n_taps: ti.i32):
+              ux: ti.f32, uy: ti.f32, length: ti.f32, n_taps: ti.i32,
+              tmask: _gp_nd2, use_mask: ti.i32):
     """apply_analog_motion_smear: mean of n_taps copies of the frame shifted
     along (ux, uy) by length * f, f spanning -0.5..+0.5 (warpAffine forward
     translation == sampling the source at (x - ox, y - oy))."""
     for y, x in ti.ndrange(h, w):
         acc = vec3(0.0)
+        wacc = 0.0
         for i in range(n_taps):
             f = ti.cast(i, ti.f32) / ti.cast(n_taps - 1, ti.f32) - 0.5
             ox = ux * length * f
             oy = uy * length * f
-            acc += _gp_bilerp3(img, ti.cast(x, ti.f32) - ox, ti.cast(y, ti.f32) - oy, w, h)
-        _gp_st3(dst, y, x, acc / ti.cast(n_taps, ti.f32))
+            tx = ti.cast(x, ti.f32) - ox
+            ty = ti.cast(y, ti.f32) - oy
+            if use_mask != 0:
+                # HUD text (tmask = its alpha) must not be smeared, nor smear into its
+                # surroundings: weight each tap by (1 - text alpha) and renormalise.
+                wt = 1.0 - ti.min(1.0, 3.0 * _gp_bilerp1(tmask, tx, ty, w, h))
+                acc += _gp_bilerp3(img, tx, ty, w, h) * wt
+                wacc += wt
+            else:
+                acc += _gp_bilerp3(img, tx, ty, w, h)
+        centre = _gp_ld3(img, y, x)
+        res = acc / ti.cast(n_taps, ti.f32)
+        if use_mask != 0:
+            m0 = ti.min(1.0, 3.0 * tmask[y, x])
+            sm = centre
+            if wacc > 1e-4:
+                sm = acc / wacc
+            res = sm * (1.0 - m0) + centre * m0
+        _gp_st3(dst, y, x, res)
 
 
 # --- chromatic aberration ---------------------------------------------------
@@ -9179,6 +9219,34 @@ def _gp_vhs(img: _gp_nd3, dst: _gp_nd3, w: ti.i32, h: ti.i32,
 
 
 # --- HUD text (sprite blit) -----------------------------------------------------
+
+@ti.kernel
+def _gp_clear1(plane: _gp_nd2, w: ti.i32, h: ti.i32):
+    for y, x in ti.ndrange(h, w):
+        plane[y, x] = 0.0
+
+
+@ti.kernel
+def _gp_hud_alpha(plane: _gp_nd2, spr: _gp_nd2, sw: ti.i32, sh: ti.i32,
+                  ix0: ti.i32, iy0: ti.i32, fx: ti.f32, fy: ti.f32, w: ti.i32, h: ti.i32):
+    """Max-blends a text sprite's coverage into an (h, w) plane (same sampling as _gp_hud_blit,
+    opacity ignored) -- the 'where is HUD text' mask the analog smear respects."""
+    for j, i in ti.ndrange(sh + 1, sw + 1):
+        x = ix0 + i
+        y = iy0 + j
+        if x >= 0 and x < w and y >= 0 and y < h:
+            u = ti.cast(i, ti.f32) - fx
+            v = ti.cast(j, ti.f32) - fy
+            u0f = ti.floor(u)
+            v0f = ti.floor(v)
+            tu = u - u0f
+            tv = v - v0f
+            u0 = ti.cast(u0f, ti.i32)
+            v0 = ti.cast(v0f, ti.i32)
+            a = ((_gp_spr_at(spr, v0, u0, sw, sh) * (1.0 - tu) + _gp_spr_at(spr, v0, u0 + 1, sw, sh) * tu) * (1.0 - tv)
+                 + (_gp_spr_at(spr, v0 + 1, u0, sw, sh) * (1.0 - tu) + _gp_spr_at(spr, v0 + 1, u0 + 1, sw, sh) * tu) * tv)
+            plane[y, x] = ti.max(plane[y, x], a)
+
 
 @ti.func
 def _gp_spr_at(spr: ti.template(), v: ti.i32, u: ti.i32, sw: ti.i32, sh: ti.i32) -> ti.f32:
@@ -9354,6 +9422,8 @@ class _GpuPostBuffers:
     d0 = property(lambda s: s._get('d0', ti.f32, (s.h, s.w)))
     d1 = property(lambda s: s._get('d1', ti.f32, (s.h, s.w)))
     sky = property(lambda s: s._get('sky', ti.f32, (s.h, s.w)))
+    hm0 = property(lambda s: s._get('hm0', ti.f32, (s.h, s.w)))
+    hm1 = property(lambda s: s._get('hm1', ti.f32, (s.h, s.w)))
     noise = property(lambda s: s._get('noise', ti.f32, (s.h, s.w, 4)))
     noise_dummy = property(lambda s: s._get('noise_dummy', ti.f32, (1, 1, 4)))
     flares = property(lambda s: s._get('flares', ti.f32, (_GP_MAX_FLARES, 8)))
@@ -9458,8 +9528,13 @@ def gpu_post_process(width, height, flares, post_fx, frame_seed=0, camera_pose=N
         # 2b) HUD text, FX mode: composited here so everything from fisheye on (bloom, flare,
         #     analog, chroma, VHS, CRT) acts on it, but AFTER DoF so it isn't depth-blurred;
         #     its depth is pulled to 0 so fog doesn't haze it.
+        text_mask = None
         if hud_in_fx is not None:
             hud_in_fx.apply_gpu(cur, depth, w, h)
+            if (post_fx.get('analog_enabled', False) and post_fx.get('analog_strength', 0.0) > 0
+                    and post_fx.get('analog_smear', 0.0) > 0.0 and motion_px is not None):
+                hud_in_fx.alpha_gpu(buf.hm0, w, h)     # where the text is, so the smear can skip it
+                text_mask = buf.hm0
 
         # 3) Fisheye (warps depth too, and the flare positions)
         fisheye_rc = None
@@ -9469,6 +9544,10 @@ def gpu_post_process(width, height, flares, post_fx, frame_seed=0, camera_pose=N
             if _fa > 1e-4:
                 fisheye_rc = float(_frc)
                 _gp_fisheye(cur, depth, oth, buf.d1, w, h, float(_fa), fisheye_rc)
+                if text_mask is not None:
+                    # warp the text mask exactly like the image (scratch colour output is unused)
+                    _gp_fisheye(cur, text_mask, buf.t1, buf.hm1, w, h, float(_fa), fisheye_rc)
+                    text_mask = buf.hm1
                 cur, oth = oth, cur
                 depth = buf.d1
                 flares = [(*_fisheye_warp_point(sx, sy, w, h, strength), color, brightness)
@@ -9575,7 +9654,9 @@ def gpu_post_process(width, height, flares, post_fx, frame_seed=0, camera_pose=N
                     length = min(max_px, mag * smear)
                     if length >= 0.4:
                         n_taps = max(3, min(16, int(round(length)) + 3))
-                        _gp_smear(cur, oth, w, h, float(dx / mag), float(dy / mag), float(length), int(n_taps))
+                        _gp_smear(cur, oth, w, h, float(dx / mag), float(dy / mag), float(length), int(n_taps),
+                                  text_mask if text_mask is not None else buf.d0,
+                                  1 if text_mask is not None else 0)
                         cur, oth = oth, cur
 
         # 9) Chromatic aberration
@@ -10016,6 +10097,31 @@ class HudFrame:
                 dreg = depth[ya:ya + a.shape[0], xa:xa + a.shape[1]]
                 dreg[:] = dreg * (1.0 - a[..., 0])
         return img, depth
+
+    def alpha_float(self, H, W):
+        """Coverage of all text (0..1, opacity ignored) as an (H, W) float32 plane -- used to
+        keep HUD text out of the analog motion smear."""
+        m = np.zeros((H, W), dtype=np.float32)
+        for s in self.sprites:
+            r = _hud_alpha_roi(s['mask'], s['x0'], s['y0'], W, H)
+            if r is None:
+                continue
+            xa, ya, a = r
+            reg = m[ya:ya + a.shape[0], xa:xa + a.shape[1]]
+            np.maximum(reg, a, out=reg)
+        return m
+
+    def alpha_gpu(self, plane, w, h):
+        """GPU version of alpha_float: clears `plane` (h, w) and max-blends every sprite in."""
+        _gp_clear1(plane, int(w), int(h))
+        for s in self.sprites:
+            mask = s['mask']
+            sh, sw = mask.shape
+            ix, iy = int(math.floor(s['x0'])), int(math.floor(s['y0']))
+            if ix >= w or iy >= h or ix + sw + 1 <= 0 or iy + sh + 1 <= 0:
+                continue
+            _gp_hud_alpha(plane, mask, int(sw), int(sh), ix, iy,
+                          float(s['x0'] - ix), float(s['y0'] - iy), int(w), int(h))
 
     def blend_u8(self, canvas, order='rgb'):
         """In-place composite onto a uint8 (h, w, 3) image; order is 'rgb' or 'bgr'."""
@@ -11477,6 +11583,7 @@ ARROW_CODES = {
 # GTK keysym values (Linux); if an F-key doesn't respond on your platform,
 # run with --print-keys, press it, and add the printed raw code here.
 FUNCTION_CODES = {
+    'f1': {65470},
     'f5': {65474},
     'f6': {65475},
     'f7': {65476},
@@ -13386,6 +13493,7 @@ def main(argv=None):
     last_frame_time = time.time()
     _last_zoom_tick = [time.time()]  # mutable cell for the ;/' zoom ramp below (see there)
     _star_clock_start = time.time()
+    debug_hud = True              # F1 toggles the editor overlay (text, gizmo, viewfinder)
     hud_hist = HudLagHistory()    # camera orientation history for the HUD's lag option
     _next_star_update = 0.0  # wall-clock time.time() timestamp -- see the star-twinkle throttle below
 
@@ -13477,6 +13585,7 @@ def main(argv=None):
     print("3: fog | 4: god rays | 5: analog camera (Y2K camcorder: LDR/blowout/grain/smear)")
     print("H: cycle handheld camera shake (keyframe paths only)")
     print("2: type in an exact camera position/angle | `: open the post-FX properties menu")
+    print("F1: show/hide the editor overlay (debug text, gizmo, viewfinder)")
     print("F7: HUD settings (text elements, FX / lag options) | 6: CRT monitor effect")
     print("F5: world/atmosphere settings (fog, clouds, sky, sun, stars) | "
           "F6: camera/renderer settings (exposure, zoom, DoF, resolution, samples)")
@@ -13968,6 +14077,9 @@ def main(argv=None):
                 postfx_menu_cv(canvas, WIN_W, WIN_H, params,
                                title="World settings (F5)  --  Up/Down select, Left/Right adjust, Esc close",
                                subtitle=world_subtitle)
+            elif val == 'f1' and inp.one_shot('debug_hud_toggle', debounce=0.3):
+                debug_hud = not debug_hud
+                print(f"Editor overlay (debug HUD): {'on' if debug_hud else 'off'}")
             elif val == 'f7' and inp.one_shot('hud_menu', debounce=0.3):
                 # Render-HUD settings -- see _build_hud_params / section 13c.
                 _hud_build = lambda: _build_hud_params(post_fx)
@@ -14074,11 +14186,13 @@ def main(argv=None):
                 _hud_prev.blend_u8(canvas, 'bgr')
         draw_camera_path(canvas, camera_path, targeted_kf_idx, camera_pos, R,
                           tracer.half_tan, tracer.aspect, WIN_W, WIN_H)
-        draw_camera_viewfinder(canvas, WIN_W, WIN_H, WIN_W // 2, WIN_H // 2,
-                                focused=(autofocus_flash > 0.0))
+        if debug_hud:
+            draw_camera_viewfinder(canvas, WIN_W, WIN_H, WIN_W // 2, WIN_H // 2,
+                                    focused=(autofocus_flash > 0.0))
         # Small orientation compass, placed just under the pos/yaw-pitch-roll
         # text (3 lines incl. zoom) in the top-left corner.
-        draw_orientation_gizmo(canvas, 12 + 45, 12 + 3 * _HUD_LINE_H + 49, R, radius=28)
+        if debug_hud:
+            draw_orientation_gizmo(canvas, 12 + 45, 12 + 3 * _HUD_LINE_H + 49, R, radius=28)
 
         sel_kind = "spotlight" if selected_light >= n_pt_lights else "light"
         sel_num = (selected_light - n_pt_lights + 1) if selected_light >= n_pt_lights else (selected_light + 1)
@@ -14126,8 +14240,11 @@ def main(argv=None):
             _fx("fog", post_fx.get('fog_enabled', False)) + _gap
             + _fx("god rays", post_fx.get('godrays_enabled', False)) + _gap
             + _fx("analog", post_fx.get('analog_enabled', False)),
+            _fx("CRT", post_fx.get('crt_enabled', False)) + _gap
+            + _fx("HUD", post_fx.get('hud_enabled', False)),
         ]
-        draw_hud_text(canvas, WIN_W, WIN_H, tl_lines, tr_lines, bl_lines, br_lines)
+        if debug_hud:
+            draw_hud_text(canvas, WIN_W, WIN_H, tl_lines, tr_lines, bl_lines, br_lines)
 
         cv2.imshow(WINDOW_NAME, canvas)
         if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
