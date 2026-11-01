@@ -316,7 +316,11 @@ physics/logic from v8, just with comments translated to English.
      video it starts at the render's start time and runs at video speed), {t} (seconds),
      {zoom}/{z}, {w} {h} {width} {height}, {dist} (distance under the crosshair, 9999 if
      far/sky) + extras {frame} {fps} {fov} {yaw} {pitch} {roll} {px} {py} {pz}. Python format
-     specs work ({zoom:.1f}); "\\n" is a line break.
+     specs work ({zoom:.1f}); "\\n" is a line break. {rand} = random 0.000..1.000. Anything
+     in braces may be a calculation/condition, e.g. {":" if t%1<0.5 else " "} (blinking
+     colon) or {round(zoom*2)}; a typo prints once to the terminal and shows ERROR (or
+     dashes if only the format spec is wrong). --hud FILE loads a HUD exported from the
+     F7 menu ("Export this HUD to file...") over the scene's own HUD.
      Font: --hud-font PATH, else ./font.ttf, else a monospace system font, else any font.
      --no-hud turns it off for a run. Everything is stored in post_fx (hud_*), so scene
      export/import carries it. Size is in points at a 360-px-tall frame and scales with the
@@ -331,12 +335,14 @@ physics/logic from v8, just with comments translated to English.
 """
 
 import argparse
+import ast
 import base64
 import copy
 import json
 import math
 import os
 import queue
+import random
 import re
 import shutil
 import subprocess
@@ -9924,38 +9930,341 @@ class HudFontManager:
 
 # --- text variables ------------------------------------------------------------
 
-_HUD_VAR_RE = re.compile(r'\{\{|\}\}|\{([A-Za-z_][A-Za-z0-9_]*)(?::([^{}]*))?\}')
 _HUD_DEFAULT_SPEC = {'hh': '02d', 'mm': '02d', 'ss': '02d', 'rh': '02d', 'rm': '02d', 'rs': '02d',
                      't': '.2f', 'zoom': '.2f', 'z': '.2f', 'fov': '.1f', 'fps': '.2f',
-                     'px': '.2f', 'py': '.2f', 'pz': '.2f',
+                     'px': '.2f', 'py': '.2f', 'pz': '.2f', 'rand': '.3f',
                      'yaw': '.1f', 'pitch': '.1f', 'roll': '.1f'}
+_HUD_DQ = '"\u201c\u201d'          # straight + curly double quotes (a translation tool / phone keyboard may type either)
+_HUD_SQ = "'\u2018\u2019"          # straight + curly single quotes
+_HUD_MAX_EXPR = 240                # characters per {expression}
+_HUD_MAX_NODES = 120               # AST nodes per expression
+_HUD_ERR_SEEN = set()              # terminal messages already printed (they would repeat every frame)
 
 
-def hud_format_text(template, variables):
-    """Substitutes {name} / {name:format} (Python format specs, e.g. {zoom:.1f}).
-    '{{' / '}}' give literal braces, a typed backslash-n is a line break, and an
-    unknown {name} is left exactly as typed."""
+def _hud_clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+_HUD_FUNCS = {'abs': abs, 'min': min, 'max': max, 'round': round, 'int': int, 'float': float,
+              'str': str, 'len': len, 'floor': math.floor, 'ceil': math.ceil, 'sqrt': math.sqrt,
+              'sin': math.sin, 'cos': math.cos, 'tan': math.tan, 'clamp': _hud_clamp}
+_HUD_CONSTS = {'pi': math.pi, 'e': math.e}
+
+
+class HudExprError(Exception):
+    pass
+
+
+def _hud_eval(expr, variables, rng):
+    """Evaluates one HUD expression with a small whitelist interpreter (never eval()): numbers,
+    strings, the HUD variables, `rand`, + - * / // % **, comparisons, and / or / not,
+    `A if cond else B`, and the functions in _HUD_FUNCS. Anything else raises HudExprError."""
+    for ch in _HUD_DQ:
+        expr = expr.replace(ch, '"')
+    for ch in _HUD_SQ:
+        expr = expr.replace(ch, "'")
+    expr = expr.strip()
+    if not expr:
+        raise HudExprError("empty expression")
+    if len(expr) > _HUD_MAX_EXPR:
+        raise HudExprError(f"expression longer than {_HUD_MAX_EXPR} characters")
+    try:
+        tree = ast.parse(expr, mode='eval')
+    except SyntaxError as ex:
+        raise HudExprError(f"syntax error ({ex.msg})")
+    if sum(1 for _ in ast.walk(tree)) > _HUD_MAX_NODES:
+        raise HudExprError("expression too complex")
+
+    def ev(n):
+        if isinstance(n, ast.Expression):
+            return ev(n.body)
+        if isinstance(n, ast.Constant):
+            if isinstance(n.value, (int, float, str, bool)) or n.value is None:
+                return n.value
+            raise HudExprError("unsupported constant")
+        if isinstance(n, ast.Name):
+            if n.id == 'rand':
+                return rng.random()
+            if n.id in variables:
+                return variables[n.id]
+            if n.id in _HUD_CONSTS:
+                return _HUD_CONSTS[n.id]
+            raise HudExprError(f"unknown name '{n.id}'")
+        if isinstance(n, ast.UnaryOp):
+            v = ev(n.operand)
+            if isinstance(n.op, ast.USub):
+                return -v
+            if isinstance(n.op, ast.UAdd):
+                return +v
+            if isinstance(n.op, ast.Not):
+                return not v
+            raise HudExprError("unsupported operator")
+        if isinstance(n, ast.BinOp):
+            a, b = ev(n.left), ev(n.right)
+            op = n.op
+            if isinstance(op, ast.Add):
+                r = a + b
+            elif isinstance(op, ast.Sub):
+                r = a - b
+            elif isinstance(op, ast.Mult):
+                if (isinstance(a, str) and isinstance(b, (int, float)) and b > 200) or \
+                   (isinstance(b, str) and isinstance(a, (int, float)) and a > 200):
+                    raise HudExprError("string repeat too large")
+                r = a * b
+            elif isinstance(op, ast.Div):
+                r = a / b
+            elif isinstance(op, ast.FloorDiv):
+                r = a // b
+            elif isinstance(op, ast.Mod):
+                r = a % b
+            elif isinstance(op, ast.Pow):
+                if not isinstance(b, (int, float)) or abs(b) > 64:
+                    raise HudExprError("exponent too large")
+                r = a ** b
+            else:
+                raise HudExprError("unsupported operator")
+            if isinstance(r, str) and len(r) > 400:
+                raise HudExprError("result too long")
+            if isinstance(r, complex):
+                raise HudExprError("complex result")
+            return r
+        if isinstance(n, ast.BoolOp):
+            if isinstance(n.op, ast.And):
+                r = True
+                for v in n.values:
+                    r = ev(v)
+                    if not r:
+                        return r
+                return r
+            r = False
+            for v in n.values:
+                r = ev(v)
+                if r:
+                    return r
+            return r
+        if isinstance(n, ast.Compare):
+            left = ev(n.left)
+            for op, comp in zip(n.ops, n.comparators):
+                right = ev(comp)
+                if isinstance(op, ast.Lt):
+                    ok = left < right
+                elif isinstance(op, ast.LtE):
+                    ok = left <= right
+                elif isinstance(op, ast.Gt):
+                    ok = left > right
+                elif isinstance(op, ast.GtE):
+                    ok = left >= right
+                elif isinstance(op, ast.Eq):
+                    ok = left == right
+                elif isinstance(op, ast.NotEq):
+                    ok = left != right
+                else:
+                    raise HudExprError("unsupported comparison")
+                if not ok:
+                    return False
+                left = right
+            return True
+        if isinstance(n, ast.IfExp):
+            return ev(n.body) if ev(n.test) else ev(n.orelse)
+        if isinstance(n, ast.Call):
+            if not isinstance(n.func, ast.Name) or n.func.id not in _HUD_FUNCS or n.keywords:
+                raise HudExprError("unsupported function call")
+            return _HUD_FUNCS[n.func.id](*[ev(a) for a in n.args])
+        raise HudExprError(f"unsupported syntax ({type(n).__name__})")
+
+    return ev(tree)
+
+
+def _hud_scan(template, errors):
+    """Splits a template into ('lit', text) / ('expr', body, spec) parts. A part is
+    {expression} or {expression:format}; the ':' that starts the format is the first one
+    outside quotes and brackets (so  {":" if t%1<0.5 else " "}  is fine). '{{' / '}}' are
+    literal braces."""
+    parts, buf = [], []
+    i, n = 0, len(template)
+
+    def flush():
+        if buf:
+            parts.append(('lit', ''.join(buf)))
+            buf.clear()
+    while i < n:
+        c = template[i]
+        if c == '{':
+            if template[i + 1:i + 2] == '{':
+                buf.append('{')
+                i += 2
+                continue
+            j, depth, q, colon = i + 1, 0, None, None
+            while j < n:
+                ch = template[j]
+                if q is not None:
+                    if ch == '\\':
+                        j += 2
+                        continue
+                    if ch in q:
+                        q = None
+                elif ch in _HUD_DQ:
+                    q = _HUD_DQ
+                elif ch in _HUD_SQ:
+                    q = _HUD_SQ
+                elif ch in '([':
+                    depth += 1
+                elif ch in ')]':
+                    depth -= 1
+                elif ch == ':' and depth <= 0 and colon is None:
+                    colon = j
+                elif ch == '}' and depth <= 0:
+                    break
+                j += 1
+            if j >= n:
+                errors.append("missing closing '}' in HUD text")
+                buf.append(template[i:])
+                break
+            flush()
+            if colon is None:
+                parts.append(('expr', template[i + 1:j], ''))
+            else:
+                parts.append(('expr', template[i + 1:colon], template[colon + 1:j]))
+            i = j + 1
+        elif c == '}':
+            buf.append('}')
+            i += 2 if template[i + 1:i + 2] == '}' else 1
+        else:
+            buf.append(c)
+            i += 1
+    flush()
+    return parts
+
+
+def hud_format_text(template, variables, rng=None, errors=None):
+    """Fills in a HUD text template.
+      {name}  {name:spec}      a variable, optional Python format spec ({zoom:.1f})
+      {expr}  {expr:spec}      a calculation / condition, e.g.  {round(zoom*2)}
+                               {":" if t%1<0.5 else " "}   {"HOT" if dist<5 else "ok"}
+      {rand}                   random 0.000 .. 1.000 (new value for every use and frame)
+      '{{' '}}' literal braces;  backslash-n = line break.
+    A part that fails (typo, unknown name, bad format, divide by zero, ...) is reported on
+    the terminal once and shown as ERROR -- or, when only the format spec was wrong, as dashes
+    as wide as the unformatted value -- so one bad element never stops a render.
+    `errors`: pass a list to collect the messages instead of printing (menu validation)."""
+    if rng is None:
+        rng = random.Random(0)
+    errs = [] if errors is None else errors
     template = str(template).replace('\\n', '\n')
-
-    def sub(m):
-        tok = m.group(0)
-        if tok == '{{':
-            return '{'
-        if tok == '}}':
-            return '}'
-        name, spec = m.group(1), m.group(2)
-        if name not in variables:
-            return tok
-        v = variables[name]
-        if not spec:
-            spec = _HUD_DEFAULT_SPEC.get(name, '')
-            if name == 'dist' and isinstance(v, float):
-                spec = '.1f'
+    out = []
+    for part in _hud_scan(template, errs):
+        if part[0] == 'lit':
+            out.append(part[1])
+            continue
+        _, body, spec = part
+        shown = body.strip()
         try:
-            return format(v, spec)
+            simple = shown.isidentifier()
+            v = _hud_eval(body, variables, rng)
+        except HudExprError as ex:
+            errs.append(f"{{{shown}}}: {ex}")
+            out.append("ERROR")
+            continue
+        except Exception as ex:               # ZeroDivisionError, TypeError (e.g. "a" + 1), ValueError, ...
+            errs.append(f"{{{shown}}}: {type(ex).__name__}: {ex}")
+            out.append("ERROR")
+            continue
+        default = _HUD_DEFAULT_SPEC.get(shown, '') if simple else ''
+        if not default and isinstance(v, float) and not isinstance(v, bool):
+            default = '.1f' if shown == 'dist' else '.2f'
+        try:
+            base = format(v, default)
         except (ValueError, TypeError):
-            return str(v)
-    return _HUD_VAR_RE.sub(sub, template)
+            base = str(v)
+        if spec.strip():
+            try:
+                out.append(format(v, spec.strip()))
+            except (ValueError, TypeError) as ex:
+                errs.append(f"{{{shown}:{spec}}}: bad format ({ex})")
+                out.append('-' * max(1, len(base)))
+        else:
+            out.append(base)
+    if errors is None:
+        for m in errs:
+            if m not in _HUD_ERR_SEEN:
+                if len(_HUD_ERR_SEEN) > 500:
+                    _HUD_ERR_SEEN.clear()
+                _HUD_ERR_SEEN.add(m)
+                print(f"[HUD] {m}  (shown as ERROR / dashes until fixed)")
+    return ''.join(out)
+
+
+_HUD_SAMPLE_VARS = {'hh': 0, 'mm': 1, 'ss': 2, 'rh': 12, 'rm': 30, 'rs': 15, 't': 62.5, 'zoom': 1.0,
+                    'z': 1.0, 'w': 1920, 'h': 1080, 'width': 1920, 'height': 1080, 'dist': 12.5,
+                    'frame': 10, 'fps': 30.0, 'fov': 65.0, 'yaw': 0.0, 'pitch': 0.0, 'roll': 0.0,
+                    'px': 0.0, 'py': 3.0, 'pz': -8.0}
+
+
+def hud_check_text(template):
+    """Problems a HUD text template would have (list of messages; empty = fine)."""
+    errs = []
+    hud_format_text(template, _HUD_SAMPLE_VARS, random.Random(1), errors=errs)
+    return errs
+
+
+# --- HUD files (export from the F7 menu, load with --hud) ---------------------------------
+
+HUD_FILE_FORMAT = 'rv_hud'
+HUD_FILE_KEYS = ('hud_enabled', 'hud_fx', 'hud_lag', 'hud_elements')
+
+
+def hud_save_file(path, post_fx):
+    data = {'format': HUD_FILE_FORMAT, 'version': 1,
+            'hud_enabled': bool(post_fx.get('hud_enabled', True)),
+            'hud_fx': bool(post_fx.get('hud_fx', False)),
+            'hud_lag': float(post_fx.get('hud_lag', 0.0)),
+            'hud_elements': [_hud_norm_element(e) for e in post_fx.get('hud_elements', [])]}
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write('\n')
+
+
+def hud_load_file(path):
+    """Reads a HUD file. Accepts the file the F7 menu exports, a bare list of elements, or a
+    whole scene file (its post_fx HUD settings are used). Returns a dict of HUD_FILE_KEYS
+    (only those present); raises ValueError / OSError with a readable message."""
+    with open(path, 'r', encoding='utf-8') as f:
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError as ex:
+            raise ValueError(f"{path} is not valid JSON ({ex})")
+    if isinstance(data, list):
+        data = {'hud_elements': data}
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: expected a JSON object or a list of HUD elements")
+    if isinstance(data.get('post_fx'), dict) and 'hud_elements' not in data:
+        data = data['post_fx']
+    out = {}
+    if 'hud_elements' in data:
+        if not isinstance(data['hud_elements'], list) or not all(isinstance(e, dict) for e in data['hud_elements']):
+            raise ValueError(f"{path}: 'hud_elements' must be a list of objects")
+        out['hud_elements'] = [_hud_norm_element(e) for e in data['hud_elements']]
+        for i, e in enumerate(out['hud_elements']):
+            for msg in hud_check_text(e['text']):
+                print(f"[HUD] {path}, element {i + 1}: {msg}")
+    for k in ('hud_enabled', 'hud_fx'):
+        if k in data:
+            out[k] = bool(data[k])
+    if 'hud_lag' in data:
+        try:
+            out['hud_lag'] = max(0.0, float(data['hud_lag']))
+        except (TypeError, ValueError):
+            raise ValueError(f"{path}: 'hud_lag' must be a number")
+    if not out:
+        raise ValueError(f"{path}: no HUD settings found (expected 'hud_elements', ...)")
+    return out
+
+
+def hud_apply_to_post_fx(post_fx, hud_data):
+    """Replaces the HUD settings in post_fx with those from a loaded HUD file."""
+    for k, v in hud_data.items():
+        post_fx[k] = copy.deepcopy(v)
+    post_fx.setdefault('hud_enabled', True)
 
 
 def _hud_probe_dist(tracer):
@@ -9994,7 +10303,7 @@ def _hud_variables(tracer, elements, t, frame, fps, real_time):
         'pz': float(tracer.camera_pos[2]),
         'yaw': math.degrees(yaw), 'pitch': math.degrees(pitch), 'roll': math.degrees(roll),
     }
-    if any('{dist' in str(e.get('text', '')) for e in elements):
+    if any(re.search(r'\bdist\b', str(e.get('text', ''))) for e in elements):
         v['dist'] = _hud_probe_dist(tracer)
     return v
 
@@ -10191,9 +10500,10 @@ class HudRenderer:
         frame = HudFrame(w, h, fx)
         scale = min(w, h) / 360.0
         moving = abs(offset[0]) > 1e-6 or abs(offset[1]) > 1e-6
-        for raw in elements:
+        frame_no = int(variables.get('frame', 0))
+        for idx, raw in enumerate(elements):
             e = _hud_norm_element(raw)
-            text = hud_format_text(e['text'], variables)
+            text = hud_format_text(e['text'], variables, random.Random(frame_no * 100003 + idx * 7919 + 1))
             if not text.strip():
                 continue
             px = int(round(max(float(HUD_MIN_PX), e['size'] * scale)))
@@ -12622,8 +12932,9 @@ def postfx_menu_cv(canvas, sw, sh, params, title=None, subtitle=None, rebuild=No
 # =============================================================================
 
 HUD_MENU_SUBTITLE = (
-    "Variables: {hh}{mm}{ss} {rh}{rm}{rs} {t} {zoom}/{z} {w}{h}/{width}{height} {dist}",
+    "Variables: {hh}{mm}{ss} {rh}{rm}{rs} {t} {zoom}/{z} {w}{h}/{width}{height} {dist} {rand}",
     "Extras: {frame} {fps} {fov} {yaw} {pitch} {roll} {px} {py} {pz}   Format: {zoom:.1f}",
+    "Maths / conditions: {round(zoom*2)}  {\":\" if t%1<0.5 else \" \"}  {\"NEAR\" if dist<5 else \"far\"}",
     "New line: \\n   Literal braces: {{ }}   X/Y = % of frame; anchor = point of the text at X/Y",
 )
 
@@ -12701,13 +13012,18 @@ def _build_hud_params(post_fx):
 
         def edit_text(canvas, e=e):
             print("\nCurrent text:", repr(e.get('text', '')))
-            print("Variables: {hh} {mm} {ss} {rh} {rm} {rs} {t} {zoom} {z} {w} {h} {width} {height} {dist} "
+            print("Variables: {hh} {mm} {ss} {rh} {rm} {rs} {t} {zoom} {z} {w} {h} {width} {height} {dist} {rand} "
                   "(+ {frame} {fps} {fov} {yaw} {pitch} {roll} {px} {py} {pz}); {zoom:.1f} = number format; "
                   "type \\n for a new line.")
+            print("Calculations / conditions work too, e.g.  {round(zoom*2)}   {\":\" if t%1<0.5 else \" \"}   "
+                  "{\"NEAR\" if dist<5 else \"far\"}   (functions: abs min max round int float str len floor ceil "
+                  "sqrt sin cos tan clamp; constants pi e)")
             s = menu_terminal_prompt(canvas, "Type the new text in the terminal (empty = keep) ...", "text: ")
             if s is None or s == "":
                 return None
             e['text'] = s.replace('\\n', '\n')
+            for msg in hud_check_text(e['text']):
+                print(f"[HUD] problem: {msg}  (it will show as ERROR / dashes until fixed)")
             return ('rebuild', ('elem', id(e)))
 
         add(f"  [{i + 1}] {shown}", lambda e=e: e.get('text', ''), None, 'text',
@@ -12752,6 +13068,40 @@ def _build_hud_params(post_fx):
         return ('rebuild', ('elem', id(ne)))
 
     add("  + Add text element", lambda: "", None, 'action', on_enter=add_elem)
+
+    def export_hud(canvas):
+        s_ = menu_terminal_prompt(canvas, "Type a file name to export this HUD to (terminal) ...", "file [hud.json]: ")
+        if s_ is None:
+            return None
+        path = s_.strip() or 'hud.json'
+        if not os.path.splitext(path)[1]:
+            path += '.json'
+        if os.path.exists(path):
+            ok = menu_terminal_prompt(canvas, f"{path} exists -- overwrite? (terminal)", "overwrite? [y/N]: ")
+            if ok is None or ok.strip().lower() not in ('y', 'yes'):
+                print("HUD export cancelled.")
+                return None
+        try:
+            hud_save_file(path, post_fx)
+            print(f"HUD exported to {os.path.abspath(path)}  (load it with: --hud {path})")
+        except OSError as ex:
+            print(f"Could not write {path}: {ex}")
+        return None
+
+    def import_hud(canvas):
+        s_ = menu_terminal_prompt(canvas, "Type the HUD file to load (replaces the current HUD) ...", "file: ")
+        if s_ is None or not s_.strip():
+            return None
+        try:
+            hud_apply_to_post_fx(post_fx, hud_load_file(s_.strip()))
+            print(f"HUD loaded from {s_.strip()}")
+        except (OSError, ValueError) as ex:
+            print(f"Could not load HUD: {ex}")
+            return None
+        return ('rebuild', ('hud_text',))
+
+    add("Export this HUD to file...", lambda: "", None, 'action', on_enter=export_hud)
+    add("Import HUD from file...", lambda: "", None, 'action', on_enter=import_hud)
     return params
 
 
@@ -12841,6 +13191,9 @@ def parse_args(argv=None):
                     help="Path to a font file (.ttf/.otf/.ttc) for the render HUD text. If omitted, "
                          "font.ttf in the current directory is tried, then a monospace system font, "
                          "then any available font.")
+    p.add_argument('--hud', type=str, default=None, metavar='HUD_FILE',
+                    help="Load a HUD file (exported from the F7 menu: 'Export this HUD to file...') "
+                         "and use it instead of the HUD stored in the scene. --no-hud still wins.")
     p.add_argument('--no-hud', action='store_true',
                     help="Turn the render HUD off for this run (F7 in the interactive window edits it).")
     p.add_argument('--print-keys', action='store_true',
@@ -13201,6 +13554,13 @@ def main(argv=None):
         fov = 50
 
     HUD_RENDERER.fonts.set_user_path(args.hud_font)
+    if args.hud:
+        try:
+            hud_apply_to_post_fx(post_fx, hud_load_file(args.hud))
+            print(f"HUD: using {args.hud} instead of the scene's HUD")
+        except (OSError, ValueError) as ex:
+            print(f"--hud: {ex}")
+            sys.exit(1)
     if args.no_hud:
         post_fx['hud_enabled'] = False
 
@@ -14179,7 +14539,7 @@ def main(argv=None):
             _hud_now = (time.time() - replay_start_time) if replaying else (now_t - _star_clock_start)
             _hud_lag = float(post_fx.get('hud_lag', 0.0))
             hud_hist.push(now_t, tracer.camera_quat)
-            _hud_prev = make_hud_frame(tracer, post_fx, t=_hud_now, frame=0,
+            _hud_prev = make_hud_frame(tracer, post_fx, t=_hud_now, frame=int(now_t * 30),
                                        past_quat=(hud_hist.at(now_t - _hud_lag) if _hud_lag > 1e-6 else None),
                                        out_size=(WIN_W, WIN_H), overlay_only=True)
             if _hud_prev is not None:
